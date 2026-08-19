@@ -467,4 +467,25 @@ mod tests {
         assert_eq!(plugin.check(), MonitorStatus::Healthy, "out-of-bounds length must be rejected, not panic/abort the process");
         assert!(!marker.exists(), "an out-of-bounds write_file call must not write to disk");
     }
+
+    #[test]
+    fn panicking_check_is_errored_not_a_daemon_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plugin = WasmPlugin::load(&fixture_path("panics"), test_manifest("panics"), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        assert!(matches!(plugin.check(), MonitorStatus::Errored { .. }));
+        // Proof the host process itself is still alive and this plugin is still usable:
+        // a second, unrelated call still runs rather than the whole test process crashing.
+        assert!(matches!(plugin.check(), MonitorStatus::Errored { .. }));
+    }
+
+    #[test]
+    fn hanging_check_times_out_as_errored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plugin = WasmPlugin::load(&fixture_path("hangs"), test_manifest("hangs"), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        let start = std::time::Instant::now();
+        let status = plugin.check();
+        let elapsed = start.elapsed();
+        assert!(matches!(status, MonitorStatus::Errored { .. }), "expected Errored, got {status:?}");
+        assert!(elapsed < Duration::from_secs(10), "epoch deadline should kill the call well under 10s, took {elapsed:?}");
+    }
 }
