@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+// snake_case: every manifest.toml in the plan (and the design spec) writes
+// capabilities as e.g. "write_file"/"read_file", not "WriteFile"/"ReadFile" --
+// without this, toml::from_str::<ManifestToml> in kennel-daemon's
+// scan_and_register rejects every real manifest with an "unknown variant" error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     Spawn,
     Launchctl,

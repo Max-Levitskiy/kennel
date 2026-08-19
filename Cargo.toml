@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/kennel-proto", "crates/kennel-daemon", "crates/kennel-guest-sdk", "crates/kennel-gui", "fixtures/always-healthy", "fixtures/unhealthy-then-fixed", "fixtures/panics", "fixtures/hangs"]
+members = ["crates/kennel-proto", "crates/kennel-daemon", "crates/kennel-guest-sdk", "crates/kennel-gui", "fixtures/always-healthy", "fixtures/unhealthy-then-fixed", "fixtures/panics", "fixtures/hangs", "extensions-src/sd-keepalive"]

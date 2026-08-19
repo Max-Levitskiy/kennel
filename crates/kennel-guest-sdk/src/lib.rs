@@ -35,6 +35,20 @@ pub fn pack_into_scratch(bytes: &[u8]) -> u64 {
     }
 }
 
+#[link(wasm_import_module = "kennel")]
+extern "C" {
+    fn write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;
+    fn log(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32);
+}
+
+pub fn host_write_file(path: &str, data: &[u8]) -> bool {
+    unsafe { write_file(path.as_ptr() as i32, path.len() as i32, data.as_ptr() as i32, data.len() as i32) != 0 }
+}
+
+pub fn host_log(level: &str, msg: &str) {
+    unsafe { log(level.as_ptr() as i32, level.len() as i32, msg.as_ptr() as i32, msg.len() as i32) }
+}
+
 #[macro_export]
 macro_rules! kennel_extension {
     ($manifest_fn:path, $check_fn:path, $fix_fn:path) => {
