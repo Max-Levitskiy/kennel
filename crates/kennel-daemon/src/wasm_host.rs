@@ -69,7 +69,12 @@ impl WasmPlugin {
     fn read_guest_string(store: &mut Store<HostCtx>, instance: &Instance, packed: u64) -> Result<String, String> {
         let memory = instance.get_memory(&mut *store, "memory").ok_or("guest did not export memory")?;
         let ptr = (packed >> 32) as usize;
-        let len = (packed & 0xFFFF_FFFF) as usize;
+        // Clamp to the scratch buffer's documented max size (kennel_guest_sdk::SCRATCH_LEN):
+        // a well-behaved guest never reports more, and this caps how much a
+        // check()/fix() return value can make the host copy out even when ptr/len
+        // are otherwise perfectly in-bounds for a guest with a much larger memory
+        // (nothing else limits how large a guest's linear memory can grow).
+        let len = ((packed & 0xFFFF_FFFF) as usize).min(SCRATCH_LEN);
         // Slice the guest's actual linear memory first, allocate second: this
         // bounds-checks ptr/len against the real memory extent using an existing
         // slice (no allocation at all) before any `to_vec()` copy happens, so a
@@ -165,6 +170,15 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<std:
             // the recv_timeout firing and the kill landing); that's an acceptable
             // trade-off for a bounded-wait-then-kill guard, not a correctness
             // requirement for this host.
+            //
+            // TODO: this only kills the direct child pid. A child that forks a
+            // grandchild (which inherits the piped stdout/stderr fds) survives the
+            // kill, and the helper thread above then leaks forever waiting on
+            // wait_with_output() (which won't return until every fd-holder,
+            // including the grandchild, exits). Fixing this needs a process-group
+            // kill instead of a single-pid kill -- e.g. put the child in its own
+            // session/group via `setsid` (or `pre_exec` + `libc::setpgid`) at
+            // spawn time and `killpg` the whole group here.
             let _ = Command::new("/bin/kill").arg("-9").arg(pid.to_string()).status();
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -416,10 +430,16 @@ mod tests {
     fn write_file_denied_without_capability_never_touches_disk_or_panics() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("should-not-exist");
-        // data_len = -1 (reinterpreted as u32::MAX, ~4 GiB) on purpose: with the
-        // capability withheld, write_file must reject the call before it ever
-        // looks at data_ptr/data_len, so this out-of-bounds value must be inert.
-        let wat = write_file_gate_fixture_wat(&marker, -1);
+        // data_len = 4 -- deliberately a small, perfectly IN-BOUNDS length (unlike
+        // the out-of-bounds test below). This makes the assertion below meaningful:
+        // if `require_capability` were deleted from write_file, control would fall
+        // through to read_bytes(0, 4), which would succeed (4 bytes is well within
+        // the guest's one-page memory) and the marker file WOULD get written -- so
+        // this test actually exercises the capability gate itself, not the bounds
+        // check. (An out-of-bounds data_len here would make the marker's absence
+        // prove nothing about the gate: read_bytes would reject it regardless of
+        // whether require_capability ran at all.)
+        let wat = write_file_gate_fixture_wat(&marker, 4);
         let wasm_path = write_wat_fixture(dir.path(), &wat);
 
         let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), HashSet::new(), dir.path().to_path_buf()).unwrap();
