@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["crates/kennel-proto", "crates/kennel-daemon", "crates/kennel-guest-sdk", "crates/kennel-gui"]
