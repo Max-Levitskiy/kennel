@@ -3,6 +3,7 @@ mod registry;
 mod scheduler;
 mod socket;
 mod state;
+mod wasm_host;
 
 use std::path::PathBuf;
 use registry::Registry;
