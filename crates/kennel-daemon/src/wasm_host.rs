@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use kennel_proto::{Capability, ExtensionManifest, MonitorStatus};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
@@ -69,14 +69,18 @@ impl WasmPlugin {
     fn read_guest_string(store: &mut Store<HostCtx>, instance: &Instance, packed: u64) -> Result<String, String> {
         let memory = instance.get_memory(&mut *store, "memory").ok_or("guest did not export memory")?;
         let ptr = (packed >> 32) as usize;
-        // Clamp to the scratch buffer's documented max size (kennel_guest_sdk::SCRATCH_LEN):
-        // a well-behaved guest never reports more, and a malicious/corrupted return value
-        // with the low 32 bits all set (~4 GiB) would otherwise trigger a huge allocation
-        // here before wasmtime's own bounds check on `memory.read` ever runs.
-        let len = ((packed & 0xFFFF_FFFF) as usize).min(SCRATCH_LEN);
-        let mut buf = vec![0u8; len];
-        memory.read(&mut *store, ptr, &mut buf).map_err(|e| e.to_string())?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        let len = (packed & 0xFFFF_FFFF) as usize;
+        // Slice the guest's actual linear memory first, allocate second: this
+        // bounds-checks ptr/len against the real memory extent using an existing
+        // slice (no allocation at all) before any `to_vec()` copy happens, so a
+        // corrupted/malicious check()/fix() return value (e.g. the low 32 bits all
+        // set, ~4 GiB) can never drive a huge host allocation attempt.
+        let data = memory.data(&mut *store);
+        let bytes = data
+            .get(ptr..)
+            .and_then(|s| s.get(..len))
+            .ok_or_else(|| "check()/fix() returned an out-of-bounds pointer/length".to_string())?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -124,6 +128,52 @@ fn require_capability(caller: &Caller<'_, HostCtx>, cap: Capability) -> bool {
     caller.data().capabilities.contains(&cap)
 }
 
+// Wall-clock ceiling for host-spawned child processes (`spawn`, `privileged_spawn`,
+// `launchctl`, `notify`). Epoch interruption (see `fresh_instance`) only preempts
+// *guest* wasm execution -- once control has left the guest and is blocked inside a
+// host import on `Command::output()`, the epoch deadline never fires. Without this,
+// a guest calling e.g. `spawn("sleep", ["99999"])` would hang the calling thread
+// forever. Roughly matches the ~5s epoch deadline given to guest code.
+const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Runs `cmd` to completion, capturing stdout/stderr like `Command::output()` would,
+// but kills the child and returns a timeout error if it hasn't finished within
+// `timeout` instead of blocking indefinitely.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Collect output on a helper thread so this function can bound the wait with
+    // `recv_timeout` instead of blocking on `wait_with_output()` directly.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            // Hung (or a malicious/misbehaving child): SIGKILL by pid. The helper
+            // thread above will unblock once the kill lands and its result is
+            // simply dropped (its receiver is gone) -- the caller here gets a
+            // timeout error instead of blocking forever. This has the standard,
+            // accepted pid-reuse race of any kill-by-pid approach (the process could
+            // theoretically exit and its pid get recycled in the tiny window between
+            // the recv_timeout firing and the kill landing); that's an acceptable
+            // trade-off for a bounded-wait-then-kill guard, not a correctness
+            // requirement for this host.
+            let _ = Command::new("/bin/kill").arg("-9").arg(pid.to_string()).status();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command did not finish within {timeout:?}"),
+            ))
+        }
+    }
+}
+
 fn register_host_imports(linker: &mut Linker<HostCtx>) {
     linker.func_wrap("kennel", "log", |mut caller: Caller<'_, HostCtx>, level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32| {
         if !require_capability(&caller, Capability::Log) { return; }
@@ -137,7 +187,9 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let title = read_str(&mut caller, title_ptr, title_len);
         let body = read_str(&mut caller, body_ptr, body_len);
         let script = format!("display notification {:?} with title {:?}", body, title);
-        let _ = Command::new("/usr/bin/osascript").arg("-e").arg(script).output();
+        let mut command = Command::new("/usr/bin/osascript");
+        command.arg("-e").arg(script);
+        let _ = run_with_timeout(command, HOST_COMMAND_TIMEOUT);
     }).expect("register notify");
 
     linker.func_wrap("kennel", "spawn", |mut caller: Caller<'_, HostCtx>, cmd_ptr: i32, cmd_len: i32, args_ptr: i32, args_len: i32| -> u64 {
@@ -145,7 +197,9 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let cmd = read_str(&mut caller, cmd_ptr, cmd_len);
         let args_json = read_str(&mut caller, args_ptr, args_len);
         let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-        let output = Command::new(&cmd).args(&args).output();
+        let mut command = Command::new(&cmd);
+        command.args(&args);
+        let output = run_with_timeout(command, HOST_COMMAND_TIMEOUT);
         let result = match output {
             Ok(o) => serde_json::json!({
                 "exit_code": o.status.code().unwrap_or(-1),
@@ -165,7 +219,9 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         }
         let args_json = read_str(&mut caller, args_ptr, args_len);
         let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-        let output = Command::new("/usr/bin/sudo").arg("-n").arg(&cmd).args(&args).output();
+        let mut command = Command::new("/usr/bin/sudo");
+        command.arg("-n").arg(&cmd).args(&args);
+        let output = run_with_timeout(command, HOST_COMMAND_TIMEOUT);
         let result = match output {
             Ok(o) => serde_json::json!({ "exit_code": o.status.code().unwrap_or(-1), "stdout": String::from_utf8_lossy(&o.stdout), "stderr": String::from_utf8_lossy(&o.stderr) }),
             Err(e) => serde_json::json!({ "exit_code": -1, "stdout": "", "stderr": e.to_string() }),
@@ -178,7 +234,9 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let action = read_str(&mut caller, action_ptr, action_len);
         let args_json = read_str(&mut caller, args_ptr, args_len);
         let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-        let _ = Command::new("/bin/launchctl").arg(action).args(&args).output();
+        let mut command = Command::new("/bin/launchctl");
+        command.arg(action).args(&args);
+        let _ = run_with_timeout(command, HOST_COMMAND_TIMEOUT);
     }).expect("register launchctl");
 
     linker.func_wrap("kennel", "read_file", |mut caller: Caller<'_, HostCtx>, path_ptr: i32, path_len: i32| -> u64 {
@@ -191,10 +249,7 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
     linker.func_wrap("kennel", "write_file", |mut caller: Caller<'_, HostCtx>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
         if !require_capability(&caller, Capability::WriteFile) { return 0; }
         let path = read_str(&mut caller, path_ptr, path_len);
-        let memory = caller.get_export("memory").and_then(|e| e.into_memory());
-        let Some(memory) = memory else { return 0 };
-        let mut buf = vec![0u8; data_len as u32 as usize];
-        if memory.read(&caller, data_ptr as u32 as usize, &mut buf).is_err() { return 0; }
+        let Some(buf) = read_bytes(&mut caller, data_ptr, data_len) else { return 0 };
         std::fs::write(&path, &buf).is_ok() as i32
     }).expect("register write_file");
 
@@ -210,10 +265,7 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         if !require_capability(&caller, Capability::State) { return; }
         let key = read_str(&mut caller, key_ptr, key_len);
         let path = caller.data().data_dir.join(sanitize_key(&key));
-        let memory = caller.get_export("memory").and_then(|e| e.into_memory());
-        let Some(memory) = memory else { return };
-        let mut buf = vec![0u8; val_len as u32 as usize];
-        if memory.read(&caller, val_ptr as u32 as usize, &mut buf).is_err() { return; }
+        let Some(buf) = read_bytes(&mut caller, val_ptr, val_len) else { return };
         let _ = std::fs::write(&path, &buf);
     }).expect("register state_set");
 }
@@ -224,20 +276,30 @@ fn sanitize_key(key: &str) -> String {
 
 // NOTE: guest pointers/lengths cross the ABI as wasm32 `i32`, which is really an
 // unsigned 32-bit value reinterpreted as signed. Casting directly `as usize` on a
-// 64-bit host sign-extends a "negative" value to near `usize::MAX`, and
-// `vec![0u8; that]` panics immediately (capacity overflow) -- before wasmtime's
-// own bounds check on `memory.read` ever gets a chance to reject it gracefully.
-// Casting through `as u32` first reinterprets the bits as unsigned (matching wasm32
-// semantics) so a malformed guest call fails the bounds check instead of crashing
-// the host thread. See also the `.min(SCRATCH_LEN)` clamp in `read_guest_string`.
+// 64-bit host sign-extends a "negative" value to near `usize::MAX`.
+//
+// Critically, that cast alone isn't the whole story: `vec![0u8; huge]` panics on
+// allocation failure via `handle_alloc_error`, which *aborts the entire process*
+// (uncatchable, unlike a normal panic) -- so allocating a guest-length-sized buffer
+// and THEN bounds-checking it against guest memory (via `memory.read`) is backwards:
+// the attacker-controlled length reaches the allocator before wasmtime's bounds
+// check ever runs. `read_bytes` below fixes the ordering: it slices the guest's
+// *existing* memory buffer first (a plain bounds-checked slice index, no
+// allocation), and only calls `.to_vec()` -- allocating exactly `len` real,
+// in-bounds bytes -- once the slice is known to be valid. A malformed ptr/len
+// simply yields `None` here, same as any other invalid host-import call.
+fn read_bytes(caller: &mut Caller<'_, HostCtx>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    let memory = caller.get_export("memory").and_then(|e| e.into_memory())?;
+    let (ptr, len) = (ptr as u32 as usize, len as u32 as usize);
+    let data = memory.data(&*caller);
+    Some(data.get(ptr..)?.get(..len)?.to_vec())
+}
+
 fn read_str(caller: &mut Caller<'_, HostCtx>, ptr: i32, len: i32) -> String {
-    let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-        Some(m) => m,
-        None => return String::new(),
-    };
-    let mut buf = vec![0u8; len as u32 as usize];
-    if memory.read(&*caller, ptr as u32 as usize, &mut buf).is_err() { return String::new(); }
-    String::from_utf8_lossy(&buf).into_owned()
+    match read_bytes(caller, ptr, len) {
+        Some(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        None => String::new(),
+    }
 }
 
 fn write_scratch(caller: &mut Caller<'_, HostCtx>, bytes: &[u8]) -> u64 {
@@ -262,6 +324,29 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/wasm32-unknown-unknown/release").join(format!("{}.wasm", name.replace('-', "_")))
     }
 
+    #[test]
+    fn run_with_timeout_does_not_block_on_a_hung_command() {
+        // Epoch interruption never sees this -- the guest isn't executing while a
+        // host import is blocked in Command::output(). run_with_timeout is what's
+        // supposed to bound it instead.
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let result = run_with_timeout(cmd, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed < Duration::from_secs(5), "must return promptly, not wait anywhere near the child's 30s runtime (took {elapsed:?})");
+    }
+
+    #[test]
+    fn run_with_timeout_returns_captured_output_for_a_fast_command() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("hello");
+        let output = run_with_timeout(cmd, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
+
     fn test_manifest(name: &str) -> ExtensionManifest {
         ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
     }
@@ -283,5 +368,83 @@ mod tests {
         assert!(matches!(plugin.check(), MonitorStatus::Unhealthy { .. }));
         plugin.fix();
         assert!(matches!(plugin.check(), MonitorStatus::Unhealthy { .. }), "guest state must not persist across fresh instances");
+    }
+
+    // Neither fixture above ever calls a host import, so a deleted
+    // `require_capability` check -- or a reintroduced allocate-before-bounds-check
+    // bug in read_bytes()/read_str() -- wouldn't fail either of them. The following
+    // two tests exercise the `write_file` host import directly, using a
+    // hand-written WAT module (not built through kennel-guest-sdk) that imports
+    // `kennel.write_file` and calls it from `check()` with a caller-chosen,
+    // deliberately out-of-bounds `data_len`.
+    //
+    // wasmtime's `wat` feature (a default feature -- confirmed via the `wat` crate
+    // appearing in Cargo.lock's `wasmtime` dependency list) lets `Module::new`,
+    // and therefore `WasmPlugin::load` unchanged, accept WAT text directly, so the
+    // fixture below can be written straight to a temp file with no wasm32
+    // compilation step.
+    fn write_file_gate_fixture_wat(marker_path: &Path, data_len: i32) -> String {
+        let marker = marker_path.to_str().expect("marker path must be UTF-8");
+        assert!(!marker.contains(['"', '\\']), "marker path must not need WAT string escaping: {marker}");
+        format!(
+            r#"(module
+  (import "kennel" "write_file" (func $write_file (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{marker}")
+  (data (i32.const 4096) "{{\"kind\":\"Healthy\"}}")
+  (func (export "__kennel_scratch_ptr") (result i32) i32.const 8192)
+  (func (export "check") (result i64)
+    (drop (call $write_file (i32.const 0) (i32.const {path_len}) (i32.const 0) (i32.const {data_len})))
+    (i64.or
+      (i64.shl (i64.extend_i32_u (i32.const 4096)) (i64.const 32))
+      (i64.extend_i32_u (i32.const 18))))
+  (func (export "fix")))
+"#,
+            marker = marker,
+            path_len = marker.len(),
+            data_len = data_len,
+        )
+    }
+
+    fn write_wat_fixture(dir: &Path, wat: &str) -> PathBuf {
+        let path = dir.join("write_file_gate_fixture.wat");
+        std::fs::write(&path, wat).unwrap();
+        path
+    }
+
+    #[test]
+    fn write_file_denied_without_capability_never_touches_disk_or_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("should-not-exist");
+        // data_len = -1 (reinterpreted as u32::MAX, ~4 GiB) on purpose: with the
+        // capability withheld, write_file must reject the call before it ever
+        // looks at data_ptr/data_len, so this out-of-bounds value must be inert.
+        let wat = write_file_gate_fixture_wat(&marker, -1);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        assert_eq!(plugin.check(), MonitorStatus::Healthy, "host call must complete without trapping or panicking");
+        assert!(!marker.exists(), "write_file must not write when Capability::WriteFile isn't granted");
+    }
+
+    #[test]
+    fn write_file_out_of_bounds_length_is_rejected_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("should-not-exist");
+        // Capability IS granted this time, so the call reaches read_bytes()'s
+        // bounds check. The guest's memory is exactly one page (65536 bytes);
+        // data_len = -1 reinterprets to u32::MAX (~4 GiB), grossly out of bounds.
+        // Before the fix this drove `vec![0u8; ~4 GiB]` ahead of any bounds check,
+        // which aborts the whole process on allocation failure -- this test would
+        // take the entire `cargo test` run down with it, not just fail on its own,
+        // if that regressed.
+        let wat = write_file_gate_fixture_wat(&marker, -1);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        let mut capabilities = HashSet::new();
+        capabilities.insert(Capability::WriteFile);
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), capabilities, dir.path().to_path_buf()).unwrap();
+        assert_eq!(plugin.check(), MonitorStatus::Healthy, "out-of-bounds length must be rejected, not panic/abort the process");
+        assert!(!marker.exists(), "an out-of-bounds write_file call must not write to disk");
     }
 }
