@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "always-healthy"
+version = "0.1.0"
+dependencies = [
+ "kennel-guest-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -60,6 +68,10 @@ dependencies = [
 [[package]]
 name = "kennel-guest-sdk"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "kennel-gui"
@@ -199,6 +211,14 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "unhealthy-then-fixed"
+version = "0.1.0"
+dependencies = [
+ "kennel-guest-sdk",
+ "serde_json",
 ]
 
 [[package]]

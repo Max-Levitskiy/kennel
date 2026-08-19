@@ -1,0 +1,11 @@
+[package]
+name = "always-healthy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kennel-guest-sdk = { path = "../../crates/kennel-guest-sdk" }
+serde_json = "1"
