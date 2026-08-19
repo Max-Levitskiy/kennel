@@ -1,3 +1,4 @@
+mod extensions;
 mod plugin;
 mod registry;
 mod scheduler;
@@ -23,9 +24,8 @@ fn dirs_home() -> PathBuf {
 fn main() {
     let registry = Registry::new();
 
-    // Extension loading (manifest.toml + monitor.wasm scan) lands in Task 10.
-    // Until then, an empty registry still lets the socket/state plumbing be
-    // smoke-tested end to end.
+    let extensions_dir = dirs_home().join("Library/Application Support/kennel/extensions");
+    extensions::scan_and_register(&extensions_dir, &registry);
 
     let state = state::StateFile::load(&state_path());
     let mut monitors = Vec::new();
