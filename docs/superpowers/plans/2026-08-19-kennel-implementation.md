@@ -15,7 +15,7 @@
 - Platform: macOS only (launchd plists, `launchctl`, `osascript` notifications).
 - No async runtime — std threads + blocking I/O throughout, per YAGNI (this is a small local tool, not a server).
 - State persistence is a plain JSON file, never a database (per spec).
-- Control-socket wire protocol: newline-delimited JSON, one `Request`/`Response`/`Event` per line (resolved during planning; spec left this open).
+- Control-socket wire protocol: newline-delimited JSON, one `Request`/`Response` per line (resolved during planning; spec left this open — see the polling-vs-push note below Shared Types Reference for why there's no `Event` type).
 - Wasm target: `wasm32-unknown-unknown` — no WASI. All host access goes through kennel's own capability-gated imports, not WASI's separate permission model (resolved during planning; keeps one capability system instead of two).
 - Every `check()`/`fix()`/`manifest()` call runs in a **fresh** `Store`+`Instance` (no long-lived guest state across calls) — guest memory leaks are fine since the whole store is dropped after each call, and this is what makes the epoch-timeout kill-path simple and safe.
 - String return values from guest→host use a fixed 64 KiB scratch buffer the guest exports the address of once per instantiation (`__kennel_scratch_ptr`) — no host-calls-back-into-guest-allocator complexity.
@@ -112,7 +112,7 @@ pub type PluginFactory = Box<dyn Fn() -> Box<dyn Plugin> + Send + Sync>;
 - Test: `crates/kennel-proto/src/lib.rs` (inline `#[cfg(test)]`)
 
 **Interfaces:**
-- Produces: `Capability`, `ExtensionManifest`, `MonitorStatus`, `ExtensionInfo`, `Request`, `Response`, `Event` (exact shapes in Shared Types Reference above) — every later crate depends on `kennel-proto`.
+- Produces: `Capability`, `ExtensionManifest`, `MonitorStatus`, `ExtensionInfo`, `Request`, `Response` (exact shapes in Shared Types Reference above — deliberately no `Event` type, see the note below that section) — every later crate depends on `kennel-proto`.
 
 - [ ] **Step 1: Create the workspace**
 
@@ -137,7 +137,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-`crates/kennel-proto/src/lib.rs` — paste the full type definitions from the Shared Types Reference section above (the `Capability`/`ExtensionManifest`/`MonitorStatus`/`ExtensionInfo`/`Request`/`Response`/`Event` block), then append:
+`crates/kennel-proto/src/lib.rs` — paste the full type definitions from the Shared Types Reference section above (the `Capability`/`ExtensionManifest`/`MonitorStatus`/`ExtensionInfo`/`Request`/`Response` block — no `Event` type), then append:
 
 ```rust
 #[cfg(test)]
