@@ -282,6 +282,19 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let Some(buf) = read_bytes(&mut caller, val_ptr, val_len) else { return };
         let _ = std::fs::write(&path, &buf);
     }).expect("register state_set");
+
+    // Deliberately NOT capability-gated, unlike every other import above: wall-clock
+    // time isn't a meaningful security boundary for a personal single-user tool the
+    // way spawning processes or touching files is (there's nothing to protect by
+    // withholding it), and wasm32-unknown-unknown has no clock of its own to fall
+    // back on (no WASI here -- see the design doc) -- every guest needs this to do
+    // anything time-based at all (e.g. sd-keepalive's freshness timestamp).
+    linker.func_wrap("kennel", "now", |_caller: Caller<'_, HostCtx>| -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }).expect("register now");
 }
 
 fn sanitize_key(key: &str) -> String {
@@ -466,6 +479,64 @@ mod tests {
         let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), capabilities, dir.path().to_path_buf()).unwrap();
         assert_eq!(plugin.check(), MonitorStatus::Healthy, "out-of-bounds length must be rejected, not panic/abort the process");
         assert!(!marker.exists(), "an out-of-bounds write_file call must not write to disk");
+    }
+
+    // Escapes a plain string for embedding as a WAT string literal (WAT uses
+    // C-style `\"`/`\\` escaping, same idea as the marker-path assert above but
+    // applied for real since these JSON payloads do need it).
+    fn wat_escape(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    // `now` is deliberately not capability-gated (see register_host_imports), so this
+    // fixture is loaded with an empty capability set on purpose -- if a future change
+    // accidentally started gating it, this test would still pass (an implausible
+    // fallback of 0 also compares less than the threshold, correctly reporting
+    // Unhealthy) rather than silently masking the regression as a trap/Errored.
+    // check() compares the returned value against a fixed past threshold (well
+    // before this fixture could ever run) entirely in WAT -- no string formatting of
+    // the u64 is needed, so this only proves *some* plausible wall-clock value came
+    // back through the host import, not an exact one.
+    fn now_plausible_fixture_wat() -> String {
+        let healthy = "{\"kind\":\"Healthy\"}";
+        let unhealthy = "{\"kind\":\"Unhealthy\",\"detail\":\"now() returned an implausible timestamp\"}";
+        format!(
+            r#"(module
+  (import "kennel" "now" (func $now (result i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 4096) "{healthy_wat}")
+  (data (i32.const 4200) "{unhealthy_wat}")
+  (func (export "__kennel_scratch_ptr") (result i32) i32.const 8192)
+  (func (export "check") (result i64)
+    (if (result i64)
+      (i64.gt_u (call $now) (i64.const 1700000000)) ;; 2023-11-14 -- any real host clock is far past this
+      (then
+        (i64.or
+          (i64.shl (i64.extend_i32_u (i32.const 4096)) (i64.const 32))
+          (i64.extend_i32_u (i32.const {healthy_len}))))
+      (else
+        (i64.or
+          (i64.shl (i64.extend_i32_u (i32.const 4200)) (i64.const 32))
+          (i64.extend_i32_u (i32.const {unhealthy_len}))))))
+  (func (export "fix")))
+"#,
+            healthy_wat = wat_escape(healthy),
+            unhealthy_wat = wat_escape(unhealthy),
+            healthy_len = healthy.len(),
+            unhealthy_len = unhealthy.len(),
+        )
+    }
+
+    #[test]
+    fn now_import_returns_a_plausible_unix_timestamp_without_any_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let wat = now_plausible_fixture_wat();
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        // Empty capability set -- proves `now` works ungated, unlike every other
+        // host import tested above.
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("now-plausible"), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        assert_eq!(plugin.check(), MonitorStatus::Healthy, "now() should return a real, recent-ish wall-clock value with no capability granted");
     }
 
     #[test]

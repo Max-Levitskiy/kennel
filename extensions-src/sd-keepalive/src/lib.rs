@@ -1,5 +1,4 @@
-use kennel_guest_sdk::{host_log, host_write_file, kennel_extension, Manifest, Status};
-use std::time::{SystemTime, UNIX_EPOCH};
+use kennel_guest_sdk::{host_log, host_now_unix_secs, host_write_file, kennel_extension, Manifest, Status};
 
 const MOUNT_MARKER: &str = "/Volumes/Vault/.keepalive";
 
@@ -15,7 +14,7 @@ fn my_manifest() -> Manifest {
 }
 
 fn my_check() -> Status {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = host_now_unix_secs();
     let ok = host_write_file(MOUNT_MARKER, now.to_string().as_bytes());
     if ok {
         Status::Healthy

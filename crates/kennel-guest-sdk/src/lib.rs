@@ -39,6 +39,7 @@ pub fn pack_into_scratch(bytes: &[u8]) -> u64 {
 extern "C" {
     fn write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;
     fn log(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32);
+    fn now() -> u64;
 }
 
 pub fn host_write_file(path: &str, data: &[u8]) -> bool {
@@ -47,6 +48,13 @@ pub fn host_write_file(path: &str, data: &[u8]) -> bool {
 
 pub fn host_log(level: &str, msg: &str) {
     unsafe { log(level.as_ptr() as i32, level.len() as i32, msg.as_ptr() as i32, msg.len() as i32) }
+}
+
+// Unlike every other host import, `now` is deliberately not capability-gated on the
+// host side (see wasm_host.rs) -- wasm32-unknown-unknown has no clock of its own
+// (no WASI here), so this is the only way guest code can ever get wall-clock time.
+pub fn host_now_unix_secs() -> u64 {
+    unsafe { now() }
 }
 
 #[macro_export]
