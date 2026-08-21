@@ -1683,6 +1683,327 @@ git commit -m "chore: cut sd-keepalive over from LaunchAgent to kenneld"
 
 ---
 
+### Task 12b: fix live enable/disable to actually schedule and persist
+
+**Plan amendment, discovered during Task 12's real cutover.** Task 5's socket
+`Request::Enable`/`Disable` handler only ever flipped `Registry`'s in-memory
+flag — it never called `scheduler::spawn`/`stop`, and never wrote
+`state.json`. Schedulers were only ever spawned once, at startup, from
+`state.enabled` (Task 6). Live enable-via-socket has therefore never actually
+worked: it returns `Response::Ok` and does nothing. This was invisible until
+Task 12 ran the daemon persistently for the first time. It must be fixed
+before Phase 5 (GUI), whose entire point is live enable/disable — the
+project's very first requirement, established in brainstorming.
+
+Root cause: two independent implementations of "what enabling means" (the
+startup loop in `main.rs`, and the socket handler in `socket.rs`), only one
+of which was ever finished. The fix consolidates them into one.
+
+**Files:**
+- Create: `crates/kennel-daemon/src/scheduler_manager.rs`
+- Modify: `crates/kennel-daemon/src/socket.rs` (takes `Arc<SchedulerManager>` instead of `Registry`)
+- Modify: `crates/kennel-daemon/src/main.rs` (replaces the manual startup loop with `SchedulerManager`)
+
+**Interfaces:**
+- Consumes: `Registry` (Task 2), `scheduler::spawn`/`ScheduledMonitor::stop` (Task 4), `state::StateFile` (Task 3)
+- Produces: `SchedulerManager::new(registry: Registry, state_path: PathBuf) -> SchedulerManager`, `SchedulerManager::start_enabled_from_state(&self)`, `SchedulerManager::enable(&self, name: &str, persist: bool) -> Result<(), String>`, `SchedulerManager::disable(&self, name: &str) -> Result<(), String>`, `SchedulerManager::registry(&self) -> &Registry`.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/kennel-daemon/src/scheduler_manager.rs`:
+```rust
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use crate::registry::Registry;
+use crate::scheduler::{self, ScheduledMonitor};
+use crate::state::StateFile;
+
+pub struct SchedulerManager {
+    registry: Registry,
+    state_path: PathBuf,
+    scheduled: Mutex<HashMap<String, ScheduledMonitor>>,
+}
+
+impl SchedulerManager {
+    pub fn new(registry: Registry, state_path: PathBuf) -> SchedulerManager {
+        SchedulerManager { registry, state_path, scheduled: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    // Starts every extension already marked enabled in the state file.
+    // Called once at daemon startup, after extensions are scanned/registered.
+    // Does not re-persist what it just read.
+    pub fn start_enabled_from_state(&self) {
+        let state = StateFile::load(&self.state_path);
+        for name in &state.enabled {
+            let _ = self.enable(name, false);
+        }
+    }
+
+    pub fn enable(&self, name: &str, persist: bool) -> Result<(), String> {
+        self.registry.set_enabled(name, true)?;
+        let interval = self.registry.list().into_iter()
+            .find(|e| e.manifest.name == name)
+            .map(|e| e.manifest.interval_secs)
+            .ok_or_else(|| format!("unknown extension: {name}"))?;
+        let monitor = scheduler::spawn(self.registry.clone(), name.to_string(), interval);
+        let mut scheduled = self.scheduled.lock().unwrap();
+        if let Some(old) = scheduled.insert(name.to_string(), monitor) {
+            old.stop(); // re-enabling an already-running monitor replaces it, never leaks the old thread
+        }
+        drop(scheduled);
+        if persist {
+            self.persist();
+        }
+        Ok(())
+    }
+
+    pub fn disable(&self, name: &str) -> Result<(), String> {
+        self.registry.set_enabled(name, false)?;
+        if let Some(monitor) = self.scheduled.lock().unwrap().remove(name) {
+            monitor.stop();
+        }
+        self.persist();
+        Ok(())
+    }
+
+    fn persist(&self) {
+        let state = StateFile { enabled: self.registry.enabled_names() };
+        let _ = state.save(&self.state_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::{Plugin, PluginFactory};
+    use kennel_proto::{ExtensionManifest, MonitorStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct CountingPlugin {
+        checks: Arc<AtomicUsize>,
+    }
+    impl Plugin for CountingPlugin {
+        fn manifest(&self) -> ExtensionManifest {
+            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+        }
+        fn check(&mut self) -> MonitorStatus {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            MonitorStatus::Healthy
+        }
+        fn fix(&mut self) {}
+    }
+
+    fn manifest() -> ExtensionManifest {
+        ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+    }
+
+    #[test]
+    fn enable_actually_starts_ticking_and_persists_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_factory = checks.clone();
+        let registry = Registry::new();
+        registry.register(manifest(), Box::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
+
+        let manager = SchedulerManager::new(registry, state_path.clone());
+        manager.enable("counting", true).unwrap();
+
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(checks.load(Ordering::SeqCst) >= 1, "enable() must actually schedule ticks, not just flip a flag");
+
+        let saved = StateFile::load(&state_path);
+        assert_eq!(saved.enabled, vec!["counting"], "enable() must persist to state.json");
+
+        manager.disable("counting").unwrap();
+        let count_at_disable = checks.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(checks.load(Ordering::SeqCst), count_at_disable, "disable() must actually stop the scheduler thread");
+
+        let saved = StateFile::load(&state_path);
+        assert!(saved.enabled.is_empty(), "disable() must persist to state.json");
+    }
+
+    #[test]
+    fn start_enabled_from_state_schedules_without_rewriting_the_file_it_just_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        StateFile { enabled: vec!["counting".into()] }.save(&state_path).unwrap();
+        let before = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_factory = checks.clone();
+        let registry = Registry::new();
+        registry.register(manifest(), Box::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
+
+        let manager = SchedulerManager::new(registry, state_path.clone());
+        manager.start_enabled_from_state();
+
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(checks.load(Ordering::SeqCst) >= 1, "start_enabled_from_state() must actually schedule ticks");
+
+        let after = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "start_enabled_from_state() must not rewrite the file it just loaded from");
+    }
+}
+```
+
+- [ ] **Step 2: Wire the module**
+
+Add `mod scheduler_manager;` to `crates/kennel-daemon/src/main.rs`.
+
+- [ ] **Step 3: Run test, verify it fails first**
+
+Run: `cargo test -p kennel-daemon scheduler_manager::`
+Expected: compile error (module doesn't exist in `main.rs` yet) until Step 2, then passes once Step 1's code is in place — since this is new code written in one pass, confirm it compiles and both tests genuinely exercise ticking (not something that would pass even with a no-op `enable`/`disable`).
+
+- [ ] **Step 4: Update `socket.rs` to route through `SchedulerManager`**
+
+Replace `socket.rs`'s `serve`/`handle_connection`/`handle_request` to take `Arc<SchedulerManager>` instead of `Registry`:
+
+```rust
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::sync::Arc;
+use kennel_proto::{Request, Response};
+use crate::scheduler_manager::SchedulerManager;
+
+pub fn serve(path: &Path, manager: Arc<SchedulerManager>) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let manager = manager.clone();
+        std::thread::spawn(move || handle_connection(stream, manager));
+    }
+    Ok(())
+}
+
+fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>) {
+    let reader = BufReader::new(stream.try_clone().expect("clone unix stream"));
+    let mut writer = stream;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() { continue; }
+        let response = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => handle_request(&manager, req),
+            Err(e) => Response::Error { message: format!("bad request: {e}") },
+        };
+        let mut out = serde_json::to_string(&response).expect("Response always serializes");
+        out.push('\n');
+        if writer.write_all(out.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+fn handle_request(manager: &SchedulerManager, req: Request) -> Response {
+    match req {
+        Request::List => Response::Extensions(manager.registry().list()),
+        Request::Enable { name } => match manager.enable(&name, true) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
+        Request::Disable { name } => match manager.disable(&name) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
+    }
+}
+```
+
+Update `socket.rs`'s existing test (`list_enable_disable_round_trip_over_socket`) to construct a `SchedulerManager` (wrapped in `Arc::new`) instead of a bare `Registry`, and pass that to `serve`. Add one new assertion to that same test: after `Enable`, sleep briefly and confirm the extension's `last_status` becomes `Some(MonitorStatus::Healthy)` via a `List` call — proving the socket path now genuinely schedules, not just flips the flag (this is the exact gap that shipped silently before). Use an `interval_secs: 1` plugin in the test fixture so the wait is short.
+
+- [ ] **Step 5: Update `main.rs`**
+
+```rust
+mod extensions;
+mod plugin;
+mod registry;
+mod scheduler;
+mod scheduler_manager;
+mod socket;
+mod state;
+mod wasm_host;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use registry::Registry;
+use scheduler_manager::SchedulerManager;
+
+fn socket_path() -> PathBuf {
+    dirs_home().join("Library/Application Support/kennel/control.sock")
+}
+
+fn state_path() -> PathBuf {
+    dirs_home().join("Library/Application Support/kennel/state.json")
+}
+
+fn dirs_home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").expect("HOME must be set"))
+}
+
+fn main() {
+    let registry = Registry::new();
+
+    let extensions_dir = dirs_home().join("Library/Application Support/kennel/extensions");
+    extensions::scan_and_register(&extensions_dir, &registry);
+
+    let manager = Arc::new(SchedulerManager::new(registry, state_path()));
+    manager.start_enabled_from_state();
+
+    let sock_path = socket_path();
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent).expect("create kennel support dir");
+    }
+    println!("kenneld listening on {}", sock_path.display());
+    socket::serve(&sock_path, manager).expect("socket server crashed");
+}
+```
+
+- [ ] **Step 6: Run the full suite and verify**
+
+Run: `cargo test -p kennel-daemon`
+Expected: all tests pass, including the two new `scheduler_manager::` tests and the updated `socket::list_enable_disable_round_trip_over_socket`.
+
+- [ ] **Step 7: Real-machine regression check against the live cutover from Task 12**
+
+Task 12 already installed `kenneld` as a real LaunchAgent with `sd-keepalive` enabled via a manual `state.json` workaround (not through the socket, since that path was broken). After this fix:
+```bash
+cargo build --release -p kennel-daemon
+sudo cp target/release/kennel-daemon/kenneld /usr/local/bin/kenneld 2>/dev/null || sudo cp target/release/kenneld /usr/local/bin/kenneld
+launchctl kickstart -k gui/$(id -u)/com.max.kenneld
+sleep 2
+echo '"List"' | nc -U ~/Library/Application\ Support/kennel/control.sock
+```
+Expected: `sd-keepalive` still shows `enabled: true` (state.json survived the rebuild) and `last_status` becomes `Healthy` within a couple seconds. Then prove the *live* socket path specifically works (the actual bug being fixed):
+```bash
+echo '{"Disable":{"name":"sd-keepalive"}}' | nc -U ~/Library/Application\ Support/kennel/control.sock
+sleep 3
+cat ~/Library/Application\ Support/kennel/state.json   # "enabled" must no longer list sd-keepalive
+echo '{"Enable":{"name":"sd-keepalive"}}' | nc -U ~/Library/Application\ Support/kennel/control.sock
+sleep 3
+cat /Volumes/Vault/.keepalive   # must be fresh again, proving live Enable actually started ticking
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/kennel-daemon/src/scheduler_manager.rs crates/kennel-daemon/src/socket.rs crates/kennel-daemon/src/main.rs
+git commit -m "fix: make live enable/disable actually schedule and persist (was a no-op since Task 5/6)"
+```
+
+---
+
 ## Phase 5 — GUI
 
 ### Task 13: `kennel-gui` scaffold with a socket client and Installed tab
