@@ -1,0 +1,5 @@
+name = "sd-keepalive"
+version = "0.1.0"
+description = "Touches /Volumes/Vault/.keepalive periodically so the GL9755 SD reader's PCIe link never idle-parks"
+interval_secs = 2
+capabilities = ["write_file", "log"]
