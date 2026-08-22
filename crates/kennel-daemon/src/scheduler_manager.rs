@@ -113,7 +113,7 @@ mod tests {
         let checks = Arc::new(AtomicUsize::new(0));
         let checks_for_factory = checks.clone();
         let registry = Registry::new();
-        registry.register(manifest(), Box::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
+        registry.register(manifest(), Arc::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
 
         let manager = SchedulerManager::new(registry, state_path.clone());
         manager.enable("counting", true).unwrap();
@@ -143,7 +143,7 @@ mod tests {
         let checks = Arc::new(AtomicUsize::new(0));
         let checks_for_factory = checks.clone();
         let registry = Registry::new();
-        registry.register(manifest(), Box::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
+        registry.register(manifest(), Arc::new(move || Box::new(CountingPlugin { checks: checks_for_factory.clone() }) as Box<dyn Plugin>) as PluginFactory);
 
         let manager = SchedulerManager::new(registry, state_path.clone());
         manager.start_enabled_from_state();
@@ -200,7 +200,7 @@ mod tests {
         let registry = Registry::new();
         registry.register(
             manifest(),
-            Box::new(move || Box::new(ConcurrencyTrackingPlugin {
+            Arc::new(move || Box::new(ConcurrencyTrackingPlugin {
                 checks: c1.clone(),
                 concurrent: cc1.clone(),
                 max_concurrent: mc1.clone(),

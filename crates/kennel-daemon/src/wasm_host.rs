@@ -1,6 +1,8 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use kennel_proto::{Capability, ExtensionManifest, MonitorStatus};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
@@ -8,20 +10,86 @@ use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 // Matches kennel_guest_sdk::SCRATCH_LEN -- the fixed size of the guest's scratch buffer.
 const SCRATCH_LEN: usize = 65536;
 
+// How often the per-engine ticker thread advances wasmtime's epoch counter.
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+
+// Wall-clock ceiling for one guest call (`check()`, `fix()`, `manifest()`),
+// enforced via epoch interruption.
+//
+// This is wall-clock, not guest-CPU: the ticker below advances the epoch while
+// the guest is parked inside a host import too, so this budget has to cover the
+// slowest legitimate host import as well. That's why it is deliberately larger
+// than HOST_COMMAND_TIMEOUT -- otherwise an extension whose probe legitimately
+// takes the full host-command timeout (gdrive-watchdog's 8s `ls` probe) would
+// trap the instant control returned to the guest, and could never report the
+// Unhealthy verdict the probe was for.
+const GUEST_CALL_DEADLINE: Duration = Duration::from_secs(13); // 8s host command + 5s of guest slack
+
 struct HostCtx {
     extension_name: String,
     capabilities: HashSet<Capability>,
     privileged_commands: Vec<String>,
     data_dir: PathBuf,
+    // Directory tree `write_file` must never write into, regardless of which
+    // extension is asking -- kennel's own support directory. See
+    // `kennel_support_dir` / `is_inside`.
+    protected_dir: Option<PathBuf>,
     scratch_ptr: i32,
 }
 
+// Stops the epoch ticker thread once the last clone of a WasmPlugin is dropped.
+// Without this the ticker would outlive its engine forever (the original C1 leak
+// spawned one such immortal thread per scheduler tick).
+struct EngineTicker {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for EngineTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+// Instrumentation for the C1 regression tests: how many times a wasmtime
+// Engine + Module (and its epoch ticker thread) has actually been built, keyed
+// by extension name. Cloning a WasmPlugin -- what every scheduler tick now does
+// -- must NOT bump this; only `WasmPlugin::load` does. Keyed by name rather than
+// a single global counter so tests running in parallel in one process can each
+// assert on their own extension without seeing other tests' loads.
+static ENGINE_BUILDS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+fn record_engine_build(name: &str) -> usize {
+    let mut guard = ENGINE_BUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let count = map.entry(name.to_string()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+// How many Engines have been built for `name` since the process started.
+#[cfg(test)]
+pub fn engine_builds(name: &str) -> usize {
+    let guard = ENGINE_BUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(name).copied()).unwrap_or(0)
+}
+
+// `Clone` is the whole point of the C1 fix: the Engine, Module and ticker thread
+// are built exactly once per extension (in `load`), and every scheduler tick
+// takes a cheap clone of this handle instead. `Engine` and `Module` are
+// internally Arc-backed -- cloning them shares the already-compiled module
+// rather than recompiling or reallocating anything -- and `fresh_instance`
+// still builds a brand-new `Store`+`Instance` per call, which is the part that
+// genuinely has to be per-tick (guest state must not persist across ticks).
+#[derive(Clone)]
 pub struct WasmPlugin {
     engine: Engine,
     module: Module,
     manifest: ExtensionManifest,
     capabilities: HashSet<Capability>,
     data_dir: PathBuf,
+    protected_dir: Option<PathBuf>,
+    // Shared by every clone; the ticker thread stops when the last one drops.
+    _ticker: Arc<EngineTicker>,
 }
 
 impl WasmPlugin {
@@ -31,32 +99,112 @@ impl WasmPlugin {
         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
         let bytes = std::fs::read(wasm_path).map_err(|e| e.to_string())?;
         let module = Module::new(&engine, &bytes).map_err(|e| e.to_string())?;
+        // Logged, not just counted: this line appearing once per extension is
+        // correct, and it appearing over and over for the same extension is
+        // exactly what the C1 leak looked like -- worth being visible in the
+        // daemon's log rather than only in a test assertion.
+        let builds = record_engine_build(&manifest.name);
+        println!("[{}] compiled {} (wasm engines built for this extension so far: {builds})", manifest.name, wasm_path.display());
 
         // Background ticker so per-call deadlines (fresh_instance, below) actually expire --
         // wasmtime's epoch only advances when something calls increment_epoch.
         let engine_for_ticker = engine.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(100));
-            engine_for_ticker.increment_epoch();
-        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_ticker = stop.clone();
+        std::thread::Builder::new()
+            .name(format!("kennel-epoch-{}", manifest.name))
+            .spawn(move || {
+                while !stop_for_ticker.load(Ordering::SeqCst) {
+                    std::thread::sleep(EPOCH_TICK);
+                    engine_for_ticker.increment_epoch();
+                }
+            })
+            .map_err(|e| format!("could not spawn epoch ticker thread: {e}"))?;
 
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-        Ok(WasmPlugin { engine, module, manifest, capabilities, data_dir })
+        let plugin = WasmPlugin {
+            engine,
+            module,
+            manifest,
+            capabilities,
+            data_dir,
+            protected_dir: kennel_support_dir(),
+            _ticker: Arc::new(EngineTicker { stop }),
+        };
+        plugin.verify_guest_manifest()?;
+        Ok(plugin)
+    }
+
+    // Test seam: point the `write_file` deny-list at a stand-in for
+    // ~/Library/Application Support/kennel so the guard can be exercised
+    // without a test ever writing near the real one.
+    #[cfg(test)]
+    fn with_protected_dir(mut self, dir: PathBuf) -> Self {
+        self.protected_dir = Some(dir);
+        self
+    }
+
+    // I5: the guest's exported `manifest()` used to have no callers at all, so an
+    // extension's Rust-side capability list and its manifest.toml twin could
+    // silently diverge (Task 19's sketchybar-watchdog shipped a manifest.toml
+    // missing `spawn` exactly this way). manifest.toml stays the sole authority
+    // for what is actually granted -- this cross-checks the guest's own
+    // declaration against it once, at load, and fails closed on any
+    // disagreement rather than registering a monitor whose code expects
+    // capabilities it will not get (or, worse, whose manifest.toml quietly
+    // grants more than its code admits to using).
+    //
+    // Instantiated with NO capabilities on purpose: `load` runs at daemon
+    // startup for every installed extension, including disabled ones the user
+    // has never approved, so the guest code this executes must not be able to
+    // reach any gated host import. (It is still bounded by the usual epoch
+    // deadline, so a manifest() that spins just fails the load.)
+    fn verify_guest_manifest(&self) -> Result<(), String> {
+        let (mut store, instance) = self.instantiate(HashSet::new())?;
+        let manifest_fn = instance
+            .get_typed_func::<(), u64>(&mut store, "manifest")
+            .map_err(|e| format!("guest does not export manifest() (built without kennel_guest_sdk's kennel_extension! macro?): {e}"))?;
+        let packed = manifest_fn.call(&mut store, ()).map_err(|e| format!("guest manifest() trapped: {e}"))?;
+        let json = Self::read_guest_string(&mut store, &instance, packed)?;
+
+        #[derive(serde::Deserialize)]
+        struct GuestManifest {
+            #[serde(default)]
+            capabilities: Vec<String>,
+        }
+        let guest: GuestManifest = serde_json::from_str(&json).map_err(|e| format!("guest manifest() returned unparseable JSON: {e}"))?;
+
+        let declared: std::collections::BTreeSet<String> = guest.capabilities.into_iter().collect();
+        let granted: std::collections::BTreeSet<String> = self.manifest.capabilities.iter().map(capability_name).collect();
+        if declared != granted {
+            return Err(format!(
+                "capability mismatch for {}: manifest.toml grants {:?} but the wasm's own manifest() declares {:?}",
+                self.manifest.name,
+                granted.into_iter().collect::<Vec<_>>(),
+                declared.into_iter().collect::<Vec<_>>(),
+            ));
+        }
+        Ok(())
     }
 
     fn fresh_instance(&self) -> Result<(Store<HostCtx>, Instance), String> {
+        self.instantiate(self.capabilities.clone())
+    }
+
+    fn instantiate(&self, capabilities: HashSet<Capability>) -> Result<(Store<HostCtx>, Instance), String> {
         let mut linker: Linker<HostCtx> = Linker::new(&self.engine);
         register_host_imports(&mut linker);
 
         let ctx = HostCtx {
             extension_name: self.manifest.name.clone(),
-            capabilities: self.capabilities.clone(),
+            capabilities,
             privileged_commands: self.manifest.privileged_commands.clone(),
             data_dir: self.data_dir.clone(),
+            protected_dir: self.protected_dir.clone(),
             scratch_ptr: 0,
         };
         let mut store = Store::new(&self.engine, ctx);
-        store.set_epoch_deadline(50); // ~5s at the 100ms ticker above
+        store.set_epoch_deadline((GUEST_CALL_DEADLINE.as_millis() / EPOCH_TICK.as_millis()) as u64);
 
         let instance = linker.instantiate(&mut store, &self.module).map_err(|e| e.to_string())?;
         let scratch_fn = instance.get_typed_func::<(), i32>(&mut store, "__kennel_scratch_ptr").map_err(|e| e.to_string())?;
@@ -133,13 +281,96 @@ fn require_capability(caller: &Caller<'_, HostCtx>, cap: Capability) -> bool {
     caller.data().capabilities.contains(&cap)
 }
 
+// The manifest.toml spelling of a capability ("write_file", not "WriteFile"),
+// via the same serde rename the manifest parser uses, so the two can never
+// drift apart.
+fn capability_name(cap: &Capability) -> String {
+    match serde_json::to_value(cap) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => format!("{cap:?}"),
+    }
+}
+
+// kennel's own support directory: extensions/ (every extension's manifest.toml
+// and monitor.wasm, plus each extension's private data/ dir), state.json and
+// the control socket. `write_file` is deliberately allowed to write anywhere
+// else -- that is its entire purpose (sd-keepalive touches
+// /Volumes/Vault/.keepalive) -- but nothing legitimate needs to write in here
+// through it: an extension's own storage is state_get/state_set, which is
+// already clamped to its own data dir. See `write_file`'s deny check.
+fn kennel_support_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join("Library/Application Support/kennel"))
+}
+
+// Resolves `..`/`.` textually. Done before canonicalize because the target of a
+// write usually does not exist yet, so canonicalize alone can't be relied on to
+// flatten a traversal in the not-yet-existing tail of the path.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+// Canonicalizes as much of `path` as actually exists (resolving symlinks along
+// the way) and re-appends the rest verbatim, so a path whose final components
+// don't exist yet -- the normal case for a write -- can still be compared
+// against a directory tree by prefix.
+fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
+    let normalized = lexically_normalized(path);
+    let mut existing = normalized.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            let mut out = canonical;
+            for component in tail.iter().rev() {
+                out.push(component);
+            }
+            return out;
+        }
+        let Some(file_name) = existing.file_name().map(|n| n.to_os_string()) else {
+            return normalized; // hit the root without finding anything that exists
+        };
+        tail.push(file_name);
+        let Some(parent) = existing.parent().map(|p| p.to_path_buf()) else {
+            return normalized;
+        };
+        if parent == existing {
+            return normalized;
+        }
+        existing = parent;
+    }
+}
+
+fn is_inside(target: &Path, dir: &Path) -> bool {
+    resolve_as_far_as_possible(target).starts_with(resolve_as_far_as_possible(dir))
+}
+
 // Wall-clock ceiling for host-spawned child processes (`spawn`, `privileged_spawn`,
 // `launchctl`, `notify`). Epoch interruption (see `fresh_instance`) only preempts
 // *guest* wasm execution -- once control has left the guest and is blocked inside a
 // host import on `Command::output()`, the epoch deadline never fires. Without this,
 // a guest calling e.g. `spawn("sleep", ["99999"])` would hang the calling thread
-// forever. Roughly matches the ~5s epoch deadline given to guest code.
-const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// forever.
+//
+// 8s deliberately matches the PROBE_TIMEOUT of the gdrive-watchdog.sh script this
+// host replaced: at the previous 5s every host-spawned probe was more
+// trigger-happy about declaring a "stall" than the script it was ported from
+// (a plausible cause of a real false-positive Drive restart during Task 18's
+// testing). GUEST_CALL_DEADLINE is sized to cover a host call that takes the
+// full 8s and still leave the guest room to report its verdict.
+const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 
 // Runs `cmd` to completion, capturing stdout/stderr like `Command::output()` would,
 // but kills the child and returns a timeout error if it hasn't finished within
@@ -263,6 +494,25 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
     linker.func_wrap("kennel", "write_file", |mut caller: Caller<'_, HostCtx>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32| -> i32 {
         if !require_capability(&caller, Capability::WriteFile) { return 0; }
         let path = read_str(&mut caller, path_ptr, path_len);
+        // Deny-list, not allow-list: unlike state_get/state_set (clamped to the
+        // extension's own data dir), write_file exists precisely to write to
+        // arbitrary user-chosen paths such as /Volumes/Vault/.keepalive, so it
+        // can't be confined to one directory. What it must never reach is
+        // kennel's own support tree: an extension holding write_file could
+        // otherwise rewrite ANOTHER extension's manifest.toml (silently granting
+        // it privileged_spawn) or replace its monitor.wasm outright. Applies to
+        // every extension, including writes aimed at its own directory.
+        if let Some(protected) = caller.data().protected_dir.clone() {
+            if is_inside(Path::new(&path), &protected) {
+                println!(
+                    "[{}] write_file denied: {} is inside kennel's own support directory ({})",
+                    caller.data().extension_name.clone(),
+                    path,
+                    protected.display(),
+                );
+                return 0;
+            }
+        }
         let Some(buf) = read_bytes(&mut caller, data_ptr, data_len) else { return 0 };
         std::fs::write(&path, &buf).is_ok() as i32
     }).expect("register write_file");
@@ -375,7 +625,11 @@ mod tests {
     }
 
     fn test_manifest(name: &str) -> ExtensionManifest {
-        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+        test_manifest_with_caps(name, &[])
+    }
+
+    fn test_manifest_with_caps(name: &str, capabilities: &[Capability]) -> ExtensionManifest {
+        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: capabilities.to_vec(), privileged_commands: vec![] }
     }
 
     #[test]
@@ -410,7 +664,12 @@ mod tests {
     // and therefore `WasmPlugin::load` unchanged, accept WAT text directly, so the
     // fixture below can be written straight to a temp file with no wasm32
     // compilation step.
-    fn write_file_gate_fixture_wat(marker_path: &Path, data_len: i32) -> String {
+    //
+    // Since I5 the host also *calls* the guest's exported `manifest()` at load
+    // time and refuses to load an extension whose declared capabilities don't
+    // match the manifest.toml-sourced ones, so every WAT fixture below has to
+    // export a matching `manifest()` too -- `manifest_export_wat` builds it.
+    fn write_file_gate_fixture_wat(marker_path: &Path, data_len: i32, capabilities: &[&str]) -> String {
         let marker = marker_path.to_str().expect("marker path must be UTF-8");
         assert!(!marker.contains(['"', '\\']), "marker path must not need WAT string escaping: {marker}");
         format!(
@@ -419,6 +678,7 @@ mod tests {
   (memory (export "memory") 1)
   (data (i32.const 0) "{marker}")
   (data (i32.const 4096) "{{\"kind\":\"Healthy\"}}")
+{manifest_export}
   (func (export "__kennel_scratch_ptr") (result i32) i32.const 8192)
   (func (export "check") (result i64)
     (drop (call $write_file (i32.const 0) (i32.const {path_len}) (i32.const 0) (i32.const {data_len})))
@@ -430,6 +690,24 @@ mod tests {
             marker = marker,
             path_len = marker.len(),
             data_len = data_len,
+            manifest_export = manifest_export_wat("write-file-gate", capabilities, 6000),
+        )
+    }
+
+    // A `manifest()` export matching kennel_guest_sdk's ABI (JSON packed into the
+    // scratch region as ptr<<32|len), for hand-written WAT fixtures that don't go
+    // through the guest SDK's `kennel_extension!` macro.
+    fn manifest_export_wat(name: &str, capabilities: &[&str], offset: i32) -> String {
+        let caps = capabilities.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let json = format!("{{\"name\":\"{name}\",\"version\":\"0.1.0\",\"description\":\"\",\"interval_secs\":1,\"capabilities\":[{caps}],\"privileged_commands\":[]}}");
+        format!(
+            r#"  (data (i32.const {offset}) "{escaped}")
+  (func (export "manifest") (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (i32.const {offset})) (i64.const 32))
+      (i64.extend_i32_u (i32.const {len}))))"#,
+            escaped = wat_escape(&json),
+            len = json.len(),
         )
     }
 
@@ -452,7 +730,7 @@ mod tests {
         // check. (An out-of-bounds data_len here would make the marker's absence
         // prove nothing about the gate: read_bytes would reject it regardless of
         // whether require_capability ran at all.)
-        let wat = write_file_gate_fixture_wat(&marker, 4);
+        let wat = write_file_gate_fixture_wat(&marker, 4, &[]);
         let wasm_path = write_wat_fixture(dir.path(), &wat);
 
         let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), HashSet::new(), dir.path().to_path_buf()).unwrap();
@@ -471,14 +749,136 @@ mod tests {
         // which aborts the whole process on allocation failure -- this test would
         // take the entire `cargo test` run down with it, not just fail on its own,
         // if that regressed.
-        let wat = write_file_gate_fixture_wat(&marker, -1);
+        let wat = write_file_gate_fixture_wat(&marker, -1, &["write_file"]);
         let wasm_path = write_wat_fixture(dir.path(), &wat);
 
         let mut capabilities = HashSet::new();
         capabilities.insert(Capability::WriteFile);
-        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), capabilities, dir.path().to_path_buf()).unwrap();
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest_with_caps("write-file-gate", &[Capability::WriteFile]), capabilities, dir.path().to_path_buf()).unwrap();
         assert_eq!(plugin.check(), MonitorStatus::Healthy, "out-of-bounds length must be rejected, not panic/abort the process");
         assert!(!marker.exists(), "an out-of-bounds write_file call must not write to disk");
+    }
+
+    // I3: `write_file` is intentionally unconstrained about *where* it writes
+    // (sd-keepalive's whole job is touching /Volumes/Vault/.keepalive), with one
+    // exception -- kennel's own support tree, where another extension's
+    // manifest.toml (its capability grant!) and monitor.wasm live. Both tests
+    // below grant Capability::WriteFile and use an in-bounds data_len, so the
+    // only thing that can stop the write is the deny check itself.
+    #[test]
+    fn write_file_into_kennels_own_support_dir_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stand-in for ~/Library/Application Support/kennel so this test never
+        // writes anywhere near the real one, shaped exactly like the attack:
+        // another (already installed) extension's manifest.toml.
+        let protected = dir.path().join("kennel");
+        let victim_dir = protected.join("extensions/other-extension");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim_manifest = victim_dir.join("manifest.toml");
+        // The parent directory really exists, so if the deny check were removed
+        // the write below would genuinely succeed -- this assertion is not vacuous.
+        let wat = write_file_gate_fixture_wat(&victim_manifest, 4, &["write_file"]);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        let mut capabilities = HashSet::new();
+        capabilities.insert(Capability::WriteFile);
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest_with_caps("write-file-gate", &[Capability::WriteFile]), capabilities, dir.path().to_path_buf())
+            .unwrap()
+            .with_protected_dir(protected);
+        assert_eq!(plugin.check(), MonitorStatus::Healthy, "a denied write must return cleanly, not trap");
+        assert!(!victim_manifest.exists(), "write_file must not be able to rewrite another extension's manifest.toml");
+    }
+
+    #[test]
+    fn write_file_outside_kennels_support_dir_still_succeeds() {
+        // The counterpart to the test above: proves the deny check is a
+        // deny-*list*, not an accidental allow-list. This target stands in for
+        // /Volumes/Vault/.keepalive, which sd-keepalive writes every 2s in
+        // production.
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("kennel");
+        std::fs::create_dir_all(&protected).unwrap();
+        let target = dir.path().join("keepalive-marker");
+        let wat = write_file_gate_fixture_wat(&target, 4, &["write_file"]);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        let mut capabilities = HashSet::new();
+        capabilities.insert(Capability::WriteFile);
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest_with_caps("write-file-gate", &[Capability::WriteFile]), capabilities, dir.path().to_path_buf())
+            .unwrap()
+            .with_protected_dir(protected);
+        assert_eq!(plugin.check(), MonitorStatus::Healthy);
+        assert!(target.exists(), "write_file must still work for ordinary paths outside kennel's own directory");
+    }
+
+    #[test]
+    fn is_inside_resolves_traversal_and_symlinks_in_not_yet_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("kennel");
+        std::fs::create_dir_all(protected.join("extensions")).unwrap();
+
+        // Plain containment, target doesn't exist yet.
+        assert!(is_inside(&protected.join("extensions/x/manifest.toml"), &protected));
+        // `..` traversal back into the protected tree from outside it.
+        assert!(is_inside(&dir.path().join("elsewhere/../kennel/state.json"), &protected));
+        // A symlinked parent pointing into the protected tree.
+        let link = dir.path().join("shortcut");
+        std::os::unix::fs::symlink(protected.join("extensions"), &link).unwrap();
+        assert!(is_inside(&link.join("victim/manifest.toml"), &protected));
+        // And the negative case: an ordinary path must stay allowed.
+        assert!(!is_inside(Path::new("/tmp/kennel-write-file-target"), &protected));
+        assert!(!is_inside(&dir.path().join("kennel-sibling/file"), &protected), "a sibling whose name merely starts with the protected dir's name must not be denied");
+    }
+
+    #[test]
+    fn a_wasm_whose_declared_capabilities_disagree_with_manifest_toml_fails_to_load() {
+        // I5: manifest.toml is the capability grant, but until now the guest's
+        // own exported manifest() had no callers at all, so the two could
+        // silently disagree (Task 19 shipped exactly that bug). The guest here
+        // declares `write_file`; manifest.toml grants nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("unused");
+        let wat = write_file_gate_fixture_wat(&marker, 4, &["write_file"]);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        let err = match WasmPlugin::load(&wasm_path, test_manifest("write-file-gate"), HashSet::new(), dir.path().to_path_buf()) {
+            Err(e) => e,
+            Ok(_) => panic!("a capability mismatch must fail the load, not be silently registered"),
+        };
+        assert!(err.contains("capability mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_wasm_whose_declared_capabilities_match_manifest_toml_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("unused");
+        let wat = write_file_gate_fixture_wat(&marker, 4, &["write_file"]);
+        let wasm_path = write_wat_fixture(dir.path(), &wat);
+
+        WasmPlugin::load(&wasm_path, test_manifest_with_caps("write-file-gate", &[Capability::WriteFile]), HashSet::from([Capability::WriteFile]), dir.path().to_path_buf())
+            .expect("matching declarations must load");
+    }
+
+    // C1: the daemon used to build a fresh Engine + Module + epoch ticker thread
+    // on EVERY scheduler tick (Registry::make_plugin -> the factory ->
+    // WasmPlugin::load), leaking one unjoinable OS thread and one Engine+Module
+    // per tick -- measured at ~37 threads/minute on the machine this runs on,
+    // which reaches macOS's ~8192-thread ceiling in hours. This is the
+    // unit-level half of the guard (extensions.rs holds the full
+    // scan -> registry -> tick version).
+    #[test]
+    fn cloning_a_plugin_and_ticking_it_never_rebuilds_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "engine-build-count-clone";
+        let before = engine_builds(name);
+        let plugin = WasmPlugin::load(&fixture_path("always-healthy"), test_manifest(name), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        assert_eq!(engine_builds(name), before + 1, "load() builds exactly one Engine");
+
+        for _ in 0..10 {
+            let mut per_tick = plugin.clone(); // exactly what Registry::make_plugin's factory now does
+            assert_eq!(per_tick.check(), MonitorStatus::Healthy);
+        }
+        assert_eq!(engine_builds(name), before + 1, "ticking a cloned plugin must not build another Engine (or spawn another epoch ticker thread)");
     }
 
     // Escapes a plain string for embedding as a WAT string literal (WAT uses
@@ -506,6 +906,7 @@ mod tests {
   (memory (export "memory") 1)
   (data (i32.const 4096) "{healthy_wat}")
   (data (i32.const 4200) "{unhealthy_wat}")
+{manifest_export}
   (func (export "__kennel_scratch_ptr") (result i32) i32.const 8192)
   (func (export "check") (result i64)
     (if (result i64)
@@ -524,6 +925,7 @@ mod tests {
             unhealthy_wat = wat_escape(unhealthy),
             healthy_len = healthy.len(),
             unhealthy_len = unhealthy.len(),
+            manifest_export = manifest_export_wat("now-plausible", &[], 6000),
         )
     }
 
@@ -557,6 +959,9 @@ mod tests {
         let status = plugin.check();
         let elapsed = start.elapsed();
         assert!(matches!(status, MonitorStatus::Errored { .. }), "expected Errored, got {status:?}");
-        assert!(elapsed < Duration::from_secs(10), "epoch deadline should kill the call well under 10s, took {elapsed:?}");
+        // GUEST_CALL_DEADLINE is 13s (it has to outlast an 8s host command --
+        // see its definition); this bound only proves the spin is killed rather
+        // than running forever.
+        assert!(elapsed < GUEST_CALL_DEADLINE + Duration::from_secs(10), "epoch deadline should kill the call, took {elapsed:?}");
     }
 }
