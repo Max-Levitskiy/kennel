@@ -38,6 +38,7 @@ struct KennelApp {
     install_status: HashMap<String, Result<(), String>>,
     gui_config: config::GuiConfig,
     new_repo_url: String,
+    pending_enable: Option<ExtensionInfo>,
 }
 
 impl KennelApp {
@@ -57,6 +58,7 @@ impl KennelApp {
             install_status: HashMap::new(),
             gui_config,
             new_repo_url: String::new(),
+            pending_enable: None,
         }
     }
 
@@ -113,7 +115,9 @@ impl eframe::App for KennelApp {
                         ui.horizontal(|ui| {
                             let mut enabled = ext.enabled;
                             if ui.checkbox(&mut enabled, &ext.manifest.name).changed() {
-                                if let Some(client) = &mut self.client {
+                                if enabled && !ext.manifest.capabilities.is_empty() {
+                                    self.pending_enable = Some(ext.clone());
+                                } else if let Some(client) = &mut self.client {
                                     let _ = client.set_enabled(&ext.manifest.name, enabled);
                                 }
                             }
@@ -194,6 +198,37 @@ impl eframe::App for KennelApp {
                 }
             }
         });
+
+        if let Some(ext) = self.pending_enable.clone() {
+            egui::Window::new(format!("Allow {}?", ext.manifest.name)).collapsible(false).show(ctx, |ui| {
+                ui.label(&ext.manifest.description);
+                ui.separator();
+                ui.label("This extension can:");
+                for cap in &ext.manifest.capabilities {
+                    ui.label(format!("• {:?}", cap));
+                }
+                if ext.manifest.capabilities.contains(&kennel_proto::Capability::PrivilegedSpawn) {
+                    ui.separator();
+                    ui.label("Root access requires this sudoers rule, installed by you (kennel will not write it):");
+                    ui.code(format!(
+                        "# /etc/sudoers.d/kennel-{}\n{}",
+                        ext.manifest.name,
+                        ext.manifest.privileged_commands.iter().map(|c| format!("{} ALL=(root) NOPASSWD: {}", std::env::var("USER").unwrap_or_default(), c)).collect::<Vec<_>>().join("\n")
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Allow").clicked() {
+                        if let Some(client) = &mut self.client {
+                            let _ = client.set_enabled(&ext.manifest.name, true);
+                        }
+                        self.pending_enable = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_enable = None;
+                    }
+                });
+            });
+        }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 }
