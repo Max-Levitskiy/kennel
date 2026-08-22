@@ -1980,11 +1980,14 @@ Expected: all tests pass, including the two new `scheduler_manager::` tests and 
 Task 12 already installed `kenneld` as a real LaunchAgent with `sd-keepalive` enabled via a manual `state.json` workaround (not through the socket, since that path was broken). After this fix:
 ```bash
 cargo build --release -p kennel-daemon
-sudo cp target/release/kennel-daemon/kenneld /usr/local/bin/kenneld 2>/dev/null || sudo cp target/release/kenneld /usr/local/bin/kenneld
+sudo rm -f /usr/local/bin/kenneld
+sudo cp target/release/kenneld /usr/local/bin/kenneld
+sudo codesign -f -s - /usr/local/bin/kenneld
 launchctl kickstart -k gui/$(id -u)/com.max.kenneld
 sleep 2
 echo '"List"' | nc -U ~/Library/Application\ Support/kennel/control.sock
 ```
+Redeploying over an *already-running* `kenneld` needs `rm` before `cp`, not a plain overwrite — a plain `cp` onto a running signed binary's inode invalidates macOS's cached code-signature validation and the LaunchAgent respawn-loops on `OS_REASON_CODESIGNING` until manually fixed this way. This bit for real during the final fix wave (~2 min of real downtime on this exact machine) before being caught and corrected — this note exists so it isn't rediscovered the same way again.
 Expected: `sd-keepalive` still shows `enabled: true` (state.json survived the rebuild) and `last_status` becomes `Healthy` within a couple seconds. Then prove the *live* socket path specifically works (the actual bug being fixed):
 ```bash
 echo '{"Disable":{"name":"sd-keepalive"}}' | nc -U ~/Library/Application\ Support/kennel/control.sock
@@ -2373,16 +2376,19 @@ mkdir -p /tmp/kennel-test-repo
 cp target/wasm32-unknown-unknown/release/sd_keepalive.wasm /tmp/kennel-test-repo/
 cp extensions-src/sd-keepalive/manifest.toml /tmp/kennel-test-repo/
 shasum -a 256 /tmp/kennel-test-repo/sd_keepalive.wasm
+shasum -a 256 /tmp/kennel-test-repo/manifest.toml
 ```
-Write `/tmp/kennel-test-repo/index.toml` using the sha256 printed above:
+Write `/tmp/kennel-test-repo/index.toml` using both sha256 sums printed above:
 ```toml
 [[extensions]]
 name = "sd-keepalive"
 version = "0.1.0"
 wasm_url = "http://127.0.0.1:8123/sd_keepalive.wasm"
 manifest_url = "http://127.0.0.1:8123/manifest.toml"
-sha256 = "<paste the shasum output here>"
+sha256 = "<paste the wasm shasum output here>"
+manifest_sha256 = "<paste the manifest.toml shasum output here>"
 ```
+`manifest_sha256` is required (final review finding I1, fixed during the final fix wave) — `install()` verifies both hashes and rejects a manifest whose own `name` field disagrees with the index entry's, before writing anything to disk.
 ```bash
 cd /tmp/kennel-test-repo && python3 -m http.server 8123 &
 ```

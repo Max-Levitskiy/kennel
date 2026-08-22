@@ -94,7 +94,9 @@ version = "0.1.0"
 wasm_url = "https://github.com/<user>/kennel-extensions/releases/download/v0.1.0/sd-keepalive.wasm"
 manifest_url = "https://raw.githubusercontent.com/<user>/kennel-extensions/main/sd-keepalive/manifest.toml"
 sha256 = "..."
+manifest_sha256 = "..."
 ```
+`manifest_sha256` is required, not just `sha256` for the wasm binary — the manifest is what actually grants capabilities, and hashing only the wasm would let a compromised index pin an audited binary while serving a manifest that grants extra permissions. Added during implementation (final review finding I1) after the schema above was first written without it.
 
 ## Data flow
 
