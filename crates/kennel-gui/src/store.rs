@@ -32,11 +32,22 @@ pub fn install(entry: &StoreEntry, extensions_dir: &Path) -> Result<(), String> 
     }
     let manifest_text = ureq::get(&entry.manifest_url).call().map_err(|e| e.to_string())?.into_string().map_err(|e| e.to_string())?;
 
-    let ext_dir = extensions_dir.join(&entry.name);
+    // entry.name comes verbatim from the fetched (possibly untrusted/remote) repo
+    // index -- a malicious index could set e.g. name = "../../../../somewhere" to
+    // write outside extensions_dir. sha256 verification above doesn't help here: a
+    // malicious index controls both the wasm bytes and the hash that's supposed to
+    // match them. Sanitize the same way wasm_host.rs::sanitize_key does for
+    // state_get/state_set keys, so the joined path can never contain a `/`, `\`,
+    // or traverse via `..`.
+    let ext_dir = extensions_dir.join(sanitize_name(&entry.name));
     std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
     std::fs::write(ext_dir.join("monitor.wasm"), &wasm_bytes).map_err(|e| e.to_string())?;
     std::fs::write(ext_dir.join("manifest.toml"), manifest_text).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
 trait BytesExt { fn into_bytes(self) -> Result<Vec<u8>, String>; }
@@ -66,5 +77,23 @@ mod tests {
         hasher.update(bytes);
         let digest = format!("{:x}", hasher.finalize());
         assert_ne!(digest, entry.sha256);
+    }
+
+    #[test]
+    fn sanitize_name_strips_path_traversal() {
+        // A malicious/compromised repo index controls entry.name directly (and can
+        // make its sha256 match its own malicious wasm bytes, so the hash check
+        // can't catch this) -- sanitize_name must neutralize any `..`, `/`, or `\`
+        // it contains before it's ever join()'d onto extensions_dir.
+        let sanitized = sanitize_name("../../../../evil");
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains('\\'));
+        assert!(!sanitized.contains(".."));
+
+        // And prove the join actually stays inside extensions_dir: it must not
+        // resolve to (or above) extensions_dir's own parent.
+        let extensions_dir = Path::new("/tmp/kennel-extensions-test");
+        let joined = extensions_dir.join(sanitize_name("../../../../evil"));
+        assert!(joined.starts_with(extensions_dir), "joined path {joined:?} escaped {extensions_dir:?}");
     }
 }
