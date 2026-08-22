@@ -57,6 +57,64 @@ pub fn host_now_unix_secs() -> u64 {
     unsafe { now() }
 }
 
+#[link(wasm_import_module = "kennel")]
+extern "C" {
+    fn spawn(cmd_ptr: i32, cmd_len: i32, args_ptr: i32, args_len: i32) -> u64;
+    fn privileged_spawn(cmd_ptr: i32, cmd_len: i32, args_ptr: i32, args_len: i32) -> u64;
+    fn notify(title_ptr: i32, title_len: i32, body_ptr: i32, body_len: i32);
+    fn state_get(key_ptr: i32, key_len: i32) -> u64;
+    fn state_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32);
+    fn launchctl(action_ptr: i32, action_len: i32, args_ptr: i32, args_len: i32);
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SpawnResult { pub exit_code: i32, pub stdout: String, pub stderr: String }
+
+fn unpack(packed: u64) -> (i32, i32) { ((packed >> 32) as i32, (packed & 0xFFFF_FFFF) as i32) }
+
+fn read_from_scratch(ptr: i32, len: i32) -> String {
+    unsafe { String::from_utf8_lossy(&SCRATCH.0[ptr as usize - SCRATCH.0.as_ptr() as usize..][..len as usize]).into_owned() }
+}
+
+pub fn host_spawn(cmd: &str, args: &[&str]) -> SpawnResult {
+    let args_json = serde_json::to_string(args).unwrap();
+    let packed = unsafe { spawn(cmd.as_ptr() as i32, cmd.len() as i32, args_json.as_ptr() as i32, args_json.len() as i32) };
+    let (ptr, len) = unpack(packed);
+    serde_json::from_str(&read_from_scratch(ptr, len)).unwrap_or(SpawnResult { exit_code: -1, stdout: String::new(), stderr: "bad host response".into() })
+}
+
+pub fn host_privileged_spawn(cmd: &str, args: &[&str]) -> SpawnResult {
+    let args_json = serde_json::to_string(args).unwrap();
+    let packed = unsafe { privileged_spawn(cmd.as_ptr() as i32, cmd.len() as i32, args_json.as_ptr() as i32, args_json.len() as i32) };
+    let (ptr, len) = unpack(packed);
+    serde_json::from_str(&read_from_scratch(ptr, len)).unwrap_or(SpawnResult { exit_code: -1, stdout: String::new(), stderr: "bad host response".into() })
+}
+
+pub fn host_notify(title: &str, body: &str) {
+    unsafe { notify(title.as_ptr() as i32, title.len() as i32, body.as_ptr() as i32, body.len() as i32) }
+}
+
+pub fn host_state_get(key: &str) -> String {
+    let packed = unsafe { state_get(key.as_ptr() as i32, key.len() as i32) };
+    let (ptr, len) = unpack(packed);
+    read_from_scratch(ptr, len)
+}
+
+pub fn host_state_set(key: &str, value: &str) {
+    unsafe { state_set(key.as_ptr() as i32, key.len() as i32, value.as_ptr() as i32, value.len() as i32) }
+}
+
+pub fn host_launchctl(action: &str, args: &[&str]) {
+    let args_json = serde_json::to_string(args).unwrap();
+    unsafe { launchctl(action.as_ptr() as i32, action.len() as i32, args_json.as_ptr() as i32, args_json.len() as i32) }
+}
+
+// Note: `read_from_scratch`'s pointer-subtraction trick only works because the host
+// always writes into the *same* static `SCRATCH` buffer the guest itself owns
+// (Task 8's `write_scratch` writes at the address the guest reported via
+// `__kennel_scratch_ptr`) -- this is safe specifically because guest and host agree
+// on that one buffer, not a general-purpose pointer arithmetic.
+
 #[macro_export]
 macro_rules! kennel_extension {
     ($manifest_fn:path, $check_fn:path, $fix_fn:path) => {
