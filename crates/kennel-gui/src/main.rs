@@ -4,6 +4,7 @@ use client::Client;
 use eframe::egui;
 use kennel_proto::ExtensionInfo;
 use std::path::PathBuf;
+use tray_icon::{Icon, TrayIconBuilder};
 
 fn socket_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/kennel/control.sock")
@@ -12,12 +13,15 @@ fn socket_path() -> PathBuf {
 struct KennelApp {
     client: Option<Client>,
     extensions: Vec<ExtensionInfo>,
+    _tray: Option<tray_icon::TrayIcon>,
 }
 
 impl KennelApp {
     fn new() -> Self {
         let client = Client::connect(&socket_path()).ok();
-        KennelApp { client, extensions: vec![] }
+        let icon = Icon::from_rgba(vec![80, 200, 120, 255], 1, 1).expect("1x1 icon"); // placeholder; replaced with a real asset once the GUI has one
+        let tray = TrayIconBuilder::new().with_icon(icon).with_tooltip("kennel: starting…").build().ok();
+        KennelApp { client, extensions: vec![], _tray: tray }
     }
 
     fn refresh(&mut self) {
@@ -44,6 +48,10 @@ impl KennelApp {
 impl eframe::App for KennelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh();
+        let unhealthy = self.extensions.iter().filter(|e| matches!(e.last_status, Some(kennel_proto::MonitorStatus::Unhealthy { .. } | kennel_proto::MonitorStatus::Errored { .. }))).count();
+        if let Some(tray) = &self._tray {
+            let _ = tray.set_tooltip(Some(if unhealthy == 0 { "kennel: all healthy".to_string() } else { format!("kennel: {unhealthy} unhealthy") }));
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Installed");
             if self.client.is_none() {
