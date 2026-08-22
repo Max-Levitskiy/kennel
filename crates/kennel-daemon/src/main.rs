@@ -28,7 +28,8 @@ fn main() {
     let registry = Registry::new();
 
     let extensions_dir = dirs_home().join("Library/Application Support/kennel/extensions");
-    extensions::scan_and_register(&extensions_dir, &registry);
+    let registered = extensions::scan_and_register(&extensions_dir, &registry);
+    println!("registered {} extension(s): {}", registered.len(), registered.join(", "));
 
     let manager = Arc::new(SchedulerManager::new(registry, state_path()));
     manager.start_enabled_from_state();
@@ -38,5 +39,5 @@ fn main() {
         std::fs::create_dir_all(parent).expect("create kennel support dir");
     }
     println!("kenneld listening on {}", sock_path.display());
-    socket::serve(&sock_path, manager).expect("socket server crashed");
+    socket::serve(&sock_path, manager, extensions_dir).expect("socket server crashed");
 }

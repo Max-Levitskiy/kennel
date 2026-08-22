@@ -47,6 +47,11 @@ pub enum Request {
     List,
     Enable { name: String },
     Disable { name: String },
+    // Re-scan the on-disk extensions directory and register anything new that
+    // has appeared since startup (e.g. the GUI just installed something).
+    // Deliberately payload-free: the daemon owns the extensions directory path,
+    // a client must not get to point the daemon at an arbitrary directory.
+    Rescan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +86,18 @@ mod tests {
         let req = Request::Enable { name: "gdrive-watchdog".into() };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
-        matches!(back, Request::Enable { name } if name == "gdrive-watchdog");
+        // NB: `matches!` on its own is a no-op expression -- this assertion was
+        // dead (it "passed" regardless of the result) until it was wrapped here.
+        assert!(matches!(back, Request::Enable { name } if name == "gdrive-watchdog"));
+    }
+
+    #[test]
+    fn rescan_round_trips_as_a_bare_string() {
+        // The unit variant serializes as a plain JSON string, so it can be sent
+        // over the control socket by hand: echo '"Rescan"' | nc -U ...
+        let json = serde_json::to_string(&Request::Rescan).unwrap();
+        assert_eq!(json, "\"Rescan\"");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::Rescan));
     }
 }

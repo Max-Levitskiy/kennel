@@ -1,29 +1,33 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use kennel_proto::{Request, Response};
 use crate::scheduler_manager::SchedulerManager;
 
-pub fn serve(path: &Path, manager: Arc<SchedulerManager>) -> std::io::Result<()> {
+// `extensions_dir` is the directory Request::Rescan re-scans. It is the
+// daemon's own configured path, passed in here rather than accepted from a
+// client, so no socket peer can point the daemon at a directory of its choosing.
+pub fn serve(path: &Path, manager: Arc<SchedulerManager>, extensions_dir: PathBuf) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     for stream in listener.incoming() {
         let stream = stream?;
         let manager = manager.clone();
-        std::thread::spawn(move || handle_connection(stream, manager));
+        let extensions_dir = extensions_dir.clone();
+        std::thread::spawn(move || handle_connection(stream, manager, extensions_dir));
     }
     Ok(())
 }
 
-fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>) {
+fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>, extensions_dir: PathBuf) {
     let reader = BufReader::new(stream.try_clone().expect("clone unix stream"));
     let mut writer = stream;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() { continue; }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(&manager, req),
+            Ok(req) => handle_request(&manager, req, &extensions_dir),
             Err(e) => Response::Error { message: format!("bad request: {e}") },
         };
         let mut out = serde_json::to_string(&response).expect("Response always serializes");
@@ -34,7 +38,7 @@ fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>) {
     }
 }
 
-fn handle_request(manager: &SchedulerManager, req: Request) -> Response {
+fn handle_request(manager: &SchedulerManager, req: Request, extensions_dir: &Path) -> Response {
     match req {
         Request::List => Response::Extensions(manager.registry().list()),
         Request::Enable { name } => match manager.enable(&name, true) {
@@ -45,6 +49,18 @@ fn handle_request(manager: &SchedulerManager, req: Request) -> Response {
             Ok(()) => Response::Ok,
             Err(message) => Response::Error { message },
         },
+        // Without this, an extension installed by the GUI stayed invisible to
+        // the running daemon until someone restarted it by hand -- scanning
+        // only ever happened once, at startup. scan_and_register is idempotent:
+        // already-registered extensions (including enabled, actively ticking
+        // ones) are left exactly as they are.
+        Request::Rescan => {
+            let added = crate::extensions::scan_and_register(extensions_dir, manager.registry());
+            if !added.is_empty() {
+                println!("rescan registered {} new extension(s): {}", added.len(), added.join(", "));
+            }
+            Response::Ok
+        }
     }
 }
 
@@ -75,13 +91,14 @@ mod tests {
         let registry = Registry::new();
         registry.register(
             ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] },
-            Box::new(|| Box::new(NoopPlugin) as Box<dyn Plugin>) as PluginFactory,
+            Arc::new(|| Box::new(NoopPlugin) as Box<dyn Plugin>) as PluginFactory,
         );
         let manager = Arc::new(SchedulerManager::new(registry, state_path));
 
         let serve_path = sock_path.clone();
         let serve_manager = manager.clone();
-        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager); });
+        let serve_extensions_dir = dir.path().join("extensions");
+        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir); });
         std::thread::sleep(std::time::Duration::from_millis(200)); // let the listener bind
 
         let mut conn = UnixStream::connect(&sock_path).unwrap();
@@ -110,6 +127,71 @@ mod tests {
         send(&mut conn, &Request::List);
         match recv::<Response>(&mut reader) {
             Response::Extensions(list) => assert_eq!(list[0].last_status, Some(MonitorStatus::Healthy), "Enable over the socket must actually schedule ticks, not just flip a flag"),
+            other => panic!("expected Extensions, got {other:?}"),
+        }
+    }
+
+    // I2: installing an extension from the GUI used to do nothing at all until
+    // someone restarted the daemon by hand.
+    #[test]
+    fn rescan_picks_up_an_extension_installed_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("kennel.sock");
+        let state_path = dir.path().join("state.json");
+        let extensions_dir = dir.path().join("extensions");
+        std::fs::create_dir_all(&extensions_dir).unwrap();
+
+        let manager = Arc::new(SchedulerManager::new(Registry::new(), state_path));
+        let serve_path = sock_path.clone();
+        let serve_manager = manager.clone();
+        let serve_extensions_dir = extensions_dir.clone();
+        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir); });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut conn = UnixStream::connect(&sock_path).unwrap();
+        let mut reader = BufReader::new(conn.try_clone().unwrap());
+
+        send(&mut conn, &Request::List);
+        match recv::<Response>(&mut reader) {
+            Response::Extensions(list) => assert!(list.is_empty()),
+            other => panic!("expected Extensions, got {other:?}"),
+        }
+
+        // ... the GUI installs an extension while the daemon is running ...
+        let ext_dir = extensions_dir.join("always-healthy");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("manifest.toml"), "name = \"always-healthy\"\nversion = \"0.1.0\"\ndescription = \"test\"\ninterval_secs = 1\ncapabilities = []\n").unwrap();
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/wasm32-unknown-unknown/release/always_healthy.wasm"),
+            ext_dir.join("monitor.wasm"),
+        ).unwrap();
+
+        // Without the Rescan the daemon still knows nothing about it.
+        send(&mut conn, &Request::List);
+        match recv::<Response>(&mut reader) {
+            Response::Extensions(list) => assert!(list.is_empty(), "the daemon can't know about it before a rescan"),
+            other => panic!("expected Extensions, got {other:?}"),
+        }
+
+        send(&mut conn, &Request::Rescan);
+        assert!(matches!(recv::<Response>(&mut reader), Response::Ok));
+
+        send(&mut conn, &Request::List);
+        match recv::<Response>(&mut reader) {
+            Response::Extensions(list) => {
+                assert_eq!(list.len(), 1, "Rescan must register the newly installed extension");
+                assert_eq!(list[0].manifest.name, "always-healthy");
+                assert!(!list[0].enabled, "a freshly discovered extension stays disabled until the user enables it");
+            }
+            other => panic!("expected Extensions, got {other:?}"),
+        }
+
+        // A second rescan must be a no-op rather than a duplicate/replacement.
+        send(&mut conn, &Request::Rescan);
+        assert!(matches!(recv::<Response>(&mut reader), Response::Ok));
+        send(&mut conn, &Request::List);
+        match recv::<Response>(&mut reader) {
+            Response::Extensions(list) => assert_eq!(list.len(), 1),
             other => panic!("expected Extensions, got {other:?}"),
         }
     }

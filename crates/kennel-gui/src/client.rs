@@ -32,6 +32,17 @@ impl Client {
         }
     }
 
+    // Tells the daemon to pick up extensions installed since it started -- the
+    // daemon only scans its extensions directory at startup otherwise, so a
+    // GUI install would stay invisible until someone restarted it by hand.
+    pub fn rescan(&mut self) -> Result<(), String> {
+        match self.roundtrip(&Request::Rescan)? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+
     fn roundtrip(&mut self, req: &Request) -> Result<Response, String> {
         let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
         line.push('\n');
@@ -80,7 +91,7 @@ mod tests {
                     let req: Request = serde_json::from_str(&line).unwrap();
                     let resp = match req {
                         Request::List => Response::Extensions(vec![]),
-                        Request::Enable { .. } | Request::Disable { .. } => Response::Ok,
+                        Request::Enable { .. } | Request::Disable { .. } | Request::Rescan => Response::Ok,
                     };
                     let mut out = serde_json::to_string(&resp).unwrap();
                     out.push('\n');
@@ -100,5 +111,6 @@ mod tests {
         let mut client = Client::connect(&sock).unwrap();
         assert_eq!(client.list().unwrap().len(), 0);
         client.set_enabled("sd-keepalive", true).unwrap();
+        client.rescan().unwrap();
     }
 }

@@ -88,7 +88,19 @@ impl eframe::App for KennelApp {
         self.refresh();
         let unhealthy = self.extensions.iter().filter(|e| matches!(e.last_status, Some(kennel_proto::MonitorStatus::Unhealthy { .. } | kennel_proto::MonitorStatus::Errored { .. }))).count();
         if let Some(tray) = &self._tray {
-            let _ = tray.set_tooltip(Some(if unhealthy == 0 { "kennel: all healthy".to_string() } else { format!("kennel: {unhealthy} unhealthy") }));
+            // `self.extensions` is empty both when nothing is wrong and when the
+            // daemon can't be reached at all, so an unhealthy count computed
+            // from it alone would cheerfully report "all healthy" for a kennel
+            // that isn't running -- the one situation where nothing is being
+            // watched at all. Connectivity is reported first, ahead of any count.
+            let tooltip = if self.client.is_none() {
+                "kennel: daemon not running".to_string()
+            } else if unhealthy == 0 {
+                "kennel: all healthy".to_string()
+            } else {
+                format!("kennel: {unhealthy} unhealthy")
+            };
+            let _ = tray.set_tooltip(Some(tooltip));
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -146,7 +158,22 @@ impl eframe::App for KennelApp {
                                 ui.horizontal(|ui| {
                                     ui.label(format!("{} v{}", entry.name, entry.version));
                                     if ui.button("Install").clicked() {
-                                        let result = store::install(&entry, &extensions_dir());
+                                        let mut result = store::install(&entry, &extensions_dir());
+                                        // The daemon only scans its extensions
+                                        // directory at startup, so without this
+                                        // the freshly installed extension would
+                                        // not appear in the Installed tab (or be
+                                        // enableable at all) until kenneld was
+                                        // restarted by hand.
+                                        if result.is_ok() {
+                                            if let Some(client) = &mut self.client {
+                                                if let Err(message) = client.rescan() {
+                                                    result = Err(format!("installed, but the daemon could not be told to rescan: {message}"));
+                                                }
+                                            } else {
+                                                result = Err("installed, but kenneld is not running -- it will pick this up when it next starts".to_string());
+                                            }
+                                        }
                                         self.install_status.insert(entry.name.clone(), result);
                                     }
                                     match self.install_status.get(&entry.name) {
