@@ -1,5 +1,5 @@
 name = "sketchybar-watchdog"
-version = "0.1.0"
-description = "Restarts sketchybar after the Mac wakes from sleep"
+version = "0.2.0"
+description = "Restarts sketchybar when the bar is not actually on screen"
 interval_secs = 5
-capabilities = ["launchctl", "spawn", "state"]
+capabilities = ["launchctl", "spawn", "state", "log"]

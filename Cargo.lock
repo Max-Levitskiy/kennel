@@ -2392,6 +2392,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kennel-barprobe"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-graphics",
+]
+
+[[package]]
 name = "kennel-daemon"
 version = "0.1.0"
 dependencies = [
