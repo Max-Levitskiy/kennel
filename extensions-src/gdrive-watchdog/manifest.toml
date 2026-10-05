@@ -1,5 +1,0 @@
-name = "gdrive-watchdog"
-version = "0.1.0"
-description = "Detects Google Drive FileProvider stalls and restarts Drive"
-interval_secs = 30
-capabilities = ["spawn", "notify", "state"]

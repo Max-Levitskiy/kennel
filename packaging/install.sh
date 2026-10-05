@@ -80,7 +80,8 @@ PLIST
 install -m 0755 "$REPO/target/release/kenneld" "$APP/Contents/MacOS/kenneld"
 install -m 0755 "$REPO/target/release/kennel-gui" "$APP/Contents/MacOS/kennel-gui"
 # sketchybar-watchdog spawns this to ask the window server whether a bar is
-# actually on screen; see extensions-src/sketchybar-watchdog.
+# actually on screen; see sketchybar-watchdog in
+# https://github.com/Max-Levitskiy/kennel-extensions.
 install -m 0755 "$REPO/target/release/kennel-barprobe" "$APP/Contents/MacOS/kennel-barprobe"
 # kenneld is launched by launchd directly, and kennel-barprobe is exec'd by
 # kenneld, so both need a signature of their own rather than just the bundle
