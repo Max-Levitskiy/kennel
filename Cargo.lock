@@ -2426,6 +2426,7 @@ dependencies = [
  "eframe",
  "egui",
  "kennel-proto",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -1,13 +1,19 @@
 mod client;
+mod commands;
 mod config;
+mod single_instance;
 mod store;
+mod tray;
 
 use client::Client;
+use commands::UiCommand;
 use eframe::egui;
+use egui::ViewportCommand;
 use kennel_proto::ExtensionInfo;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tray_icon::{Icon, TrayIconBuilder};
+use std::sync::mpsc::Receiver;
+use tray::{Health, Tray};
 
 fn socket_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/kennel/control.sock")
@@ -21,6 +27,10 @@ fn gui_config_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/kennel/gui-config.json")
 }
 
+fn gui_socket_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/kennel/gui.sock")
+}
+
 #[derive(PartialEq, Eq)]
 enum Tab {
     Installed,
@@ -31,7 +41,11 @@ enum Tab {
 struct KennelApp {
     client: Option<Client>,
     extensions: Vec<ExtensionInfo>,
-    _tray: Option<tray_icon::TrayIcon>,
+    tray: Option<Tray>,
+    ui_commands: Receiver<UiCommand>,
+    /// Set once the user picks "Quit Kennel", so the close that follows is
+    /// allowed through instead of being turned back into hide-to-tray.
+    quitting: bool,
     tab: Tab,
     repo_url: String,
     store_index: Option<Result<store::RepoIndex, String>>,
@@ -42,16 +56,30 @@ struct KennelApp {
 }
 
 impl KennelApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context, show_socket: Option<std::os::unix::net::UnixListener>, start_hidden: bool) -> Self {
         let client = Client::connect(&socket_path()).ok();
-        let icon = Icon::from_rgba(vec![80, 200, 120, 255], 1, 1).expect("1x1 icon"); // placeholder; replaced with a real asset once the GUI has one
-        let tray = TrayIconBuilder::new().with_icon(icon).with_tooltip("kennel: starting…").build().ok();
+        let (commands, ui_commands) = commands::commands(ctx.clone());
+        let tray = Tray::new(commands.clone());
+        if tray.is_none() {
+            eprintln!("kennel-gui: no menu bar icon available -- closing the window will quit instead of hiding");
+        }
+        if let Some(listener) = show_socket {
+            single_instance::serve(listener, commands);
+        }
+        // eframe reveals the window itself after the first frame (its
+        // white-flash fix), so launchd's `--tray` start has to hide it again
+        // from inside the app rather than by asking for an invisible window.
+        if start_hidden {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
         let gui_config = config::GuiConfig::load(&gui_config_path());
         let repo_url = gui_config.repos.first().cloned().unwrap_or_default();
         KennelApp {
             client,
             extensions: vec![],
-            _tray: tray,
+            tray,
+            ui_commands,
+            quitting: false,
             tab: Tab::Installed,
             repo_url,
             store_index: None,
@@ -81,26 +109,69 @@ impl KennelApp {
             self.client = None;
         }
     }
+
+    // `self.extensions` is empty both when nothing is wrong and when the
+    // daemon can't be reached at all, so an unhealthy count computed from it
+    // alone would cheerfully report "all healthy" for a kennel that isn't
+    // running -- the one situation where nothing is being watched at all.
+    // Connectivity is therefore reported ahead of any count.
+    fn health(&self) -> Health {
+        if self.client.is_none() {
+            return Health::DaemonDown;
+        }
+        let unhealthy = self.extensions.iter().filter(|e| matches!(e.last_status, Some(kennel_proto::MonitorStatus::Unhealthy { .. } | kennel_proto::MonitorStatus::Errored { .. }))).count();
+        if unhealthy == 0 {
+            Health::AllHealthy
+        } else {
+            Health::Unhealthy(unhealthy)
+        }
+    }
+
+    fn handle_window_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.ui_commands.try_recv() {
+            match command {
+                UiCommand::Open => {
+                    // These lines land in the LaunchAgent's log, which is the
+                    // only window kennel has into a tray app's behaviour.
+                    eprintln!("kennel-gui: showing window");
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                UiCommand::Quit => {
+                    eprintln!("kennel-gui: quitting");
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        // ⌘Q means quit everywhere else on this platform, and it reaches us as
+        // an ordinary key press -- indistinguishable, by the time it becomes a
+        // close request, from the red close button that must only hide.
+        if ctx.input(|i| i.modifiers.mac_cmd && i.key_pressed(egui::Key::Q)) {
+            eprintln!("kennel-gui: quitting");
+            self.quitting = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        // Closing the window keeps kennel watching in the menu bar; quitting
+        // is the tray's own menu item. Without a tray icon there would be no
+        // way back to a hidden window, so then a close really is a quit.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
+            eprintln!("kennel-gui: hiding window to the menu bar");
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
+    }
 }
 
 impl eframe::App for KennelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh();
-        let unhealthy = self.extensions.iter().filter(|e| matches!(e.last_status, Some(kennel_proto::MonitorStatus::Unhealthy { .. } | kennel_proto::MonitorStatus::Errored { .. }))).count();
-        if let Some(tray) = &self._tray {
-            // `self.extensions` is empty both when nothing is wrong and when the
-            // daemon can't be reached at all, so an unhealthy count computed
-            // from it alone would cheerfully report "all healthy" for a kennel
-            // that isn't running -- the one situation where nothing is being
-            // watched at all. Connectivity is reported first, ahead of any count.
-            let tooltip = if self.client.is_none() {
-                "kennel: daemon not running".to_string()
-            } else if unhealthy == 0 {
-                "kennel: all healthy".to_string()
-            } else {
-                format!("kennel: {unhealthy} unhealthy")
-            };
-            let _ = tray.set_tooltip(Some(tooltip));
+        self.handle_window_commands(ctx);
+        let health = self.health();
+        if let Some(tray) = &mut self.tray {
+            tray.report(health);
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -260,6 +331,44 @@ impl eframe::App for KennelApp {
     }
 }
 
+/// `launchctl bootout`, `pkill`, and logging out all arrive as a termination
+/// signal, which AppKit turns into the same close request the red close button
+/// produces -- and that one is deliberately reinterpreted as hide-to-tray. Left
+/// alone, kennel would swallow real termination requests and sit there until
+/// launchd escalated to SIGKILL, which is also how a reinstall would end up
+/// with two tray icons.
+fn exit_on_termination_signals() {
+    extern "C" fn exit_now(_signal: libc::c_int) {
+        // Only async-signal-safe calls are legal in here, so `_exit`, not `exit`.
+        unsafe { libc::_exit(0) };
+    }
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(signal, exit_now as libc::sighandler_t) };
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    eframe::run_native("kennel", eframe::NativeOptions::default(), Box::new(|_cc| Ok(Box::new(KennelApp::new()))))
+    exit_on_termination_signals();
+
+    // launchd starts us at login with `--tray`: kennel belongs in the menu bar
+    // from the moment the machine is usable, but nobody asked for a window to
+    // be shoved in their face on every boot.
+    let start_hidden = std::env::args().skip(1).any(|arg| arg == "--tray");
+
+    let show_socket = match single_instance::acquire(&gui_socket_path()) {
+        Ok(single_instance::Acquired::AlreadyRunning) => return Ok(()),
+        Ok(single_instance::Acquired::Primary(listener)) => Some(listener),
+        // A broken show-socket must not stop kennel from starting; the cost is
+        // only that a second launch could start a second copy.
+        Err(e) => {
+            eprintln!("kennel-gui: no show socket ({e}); a second launch will start a second copy");
+            None
+        }
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title("Kennel").with_inner_size([620.0, 460.0]).with_visible(!start_hidden),
+        ..Default::default()
+    };
+    eframe::run_native("kennel", options, Box::new(move |cc| Ok(Box::new(KennelApp::new(&cc.egui_ctx, show_socket, start_hidden)))))
 }
