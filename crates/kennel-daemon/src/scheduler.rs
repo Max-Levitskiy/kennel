@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use crate::registry::Registry;
 
 // Floor for the gap between two fix() calls for the same monitor, regardless of
@@ -24,6 +24,29 @@ fn fix_cooldown(interval_secs: u64) -> Duration {
     MIN_FIX_COOLDOWN.max(Duration::from_secs(interval_secs.saturating_mul(5)))
 }
 
+// Source of "now" for cooldown accounting. Injected only so tests can express a
+// long sleep without sleeping; production always passes `SystemTime::now`.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
+// Whether a monitor whose last fix() ran at `last_fix` may fix again at `now`.
+//
+// I7: this deliberately reads a wall clock rather than `Instant`. On macOS
+// `Instant` is backed by CLOCK_UPTIME_RAW, which *stops* while the machine is
+// asleep, so it measures awake time only. Half of what kennel watches for is
+// caused by sleep -- sketchybar-watchdog's entire health condition is "a wall
+// clock gap appeared, so the Mac was asleep" -- and gating that fix on awake
+// time silently swallowed the fix for the one wake that mattered. The cooldown
+// has to be counted on the same clock the check itself uses.
+fn fix_is_due(last_fix: Option<SystemTime>, now: SystemTime, cooldown: Duration) -> bool {
+    match last_fix {
+        None => true,
+        // A backwards jump (NTP correction, user setting the clock) makes the
+        // elapsed time unknowable. Fail open: fixing once too often is a
+        // nuisance, never fixing again is the outage this guard caused.
+        Some(last) => now.duration_since(last).map_or(true, |elapsed| elapsed >= cooldown),
+    }
+}
+
 pub struct ScheduledMonitor {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
@@ -41,10 +64,14 @@ pub fn spawn(registry: Registry, name: String, interval_secs: u64) -> ScheduledM
 }
 
 fn spawn_with_fix_cooldown(registry: Registry, name: String, interval_secs: u64, fix_cooldown: Duration) -> ScheduledMonitor {
+    spawn_with_clock(registry, name, interval_secs, fix_cooldown, Arc::new(SystemTime::now))
+}
+
+fn spawn_with_clock(registry: Registry, name: String, interval_secs: u64, fix_cooldown: Duration, now: Clock) -> ScheduledMonitor {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
     let handle = thread::spawn(move || {
-        let mut last_fix: Option<Instant> = None;
+        let mut last_fix: Option<SystemTime> = None;
         while !stop_clone.load(Ordering::SeqCst) {
             if let Some(mut plugin) = registry.make_plugin(&name) {
                 let status = plugin.check();
@@ -54,9 +81,9 @@ fn spawn_with_fix_cooldown(registry: Registry, name: String, interval_secs: u64,
                 // fix() *action* is rate-limited.
                 registry.update_status(&name, status);
                 if unhealthy {
-                    let due = last_fix.map_or(true, |last| last.elapsed() >= fix_cooldown);
-                    if due {
-                        last_fix = Some(Instant::now());
+                    let at = now();
+                    if fix_is_due(last_fix, at, fix_cooldown) {
+                        last_fix = Some(at);
                         plugin.fix();
                     }
                 }
@@ -79,6 +106,7 @@ mod tests {
     use crate::plugin::{Plugin, PluginFactory};
     use kennel_proto::{ExtensionManifest, MonitorStatus};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     struct CountingPlugin {
         checks: Arc<AtomicUsize>,
@@ -94,6 +122,27 @@ mod tests {
         }
         fn fix(&mut self) {
             self.fixes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // A clock the test drives by hand, so a "the Mac slept for ten minutes" can be
+    // expressed without the test itself taking ten minutes. Advancing it models
+    // exactly what macOS does across a sleep: wall time jumps by the whole sleep
+    // while the uptime clock behind `Instant` barely moves.
+    #[derive(Clone)]
+    struct FakeClock(Arc<Mutex<SystemTime>>);
+
+    impl FakeClock {
+        fn new() -> Self {
+            FakeClock(Arc::new(Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))))
+        }
+        fn advance(&self, by: Duration) {
+            let mut t = self.0.lock().unwrap();
+            *t += by;
+        }
+        fn as_clock(&self) -> Clock {
+            let inner = self.0.clone();
+            Arc::new(move || *inner.lock().unwrap())
         }
     }
 
@@ -159,6 +208,56 @@ mod tests {
         let fixes = fixes.load(Ordering::SeqCst);
         assert!(fixes >= 2, "fix() must resume after the cooldown elapses, got {fixes}");
         assert!(fixes < checks.load(Ordering::SeqCst), "...but still not once per tick");
+    }
+
+    // I7: the cooldown used to be measured with `Instant`, which on macOS stops
+    // while the machine is asleep. sketchybar-watchdog exists *because* of sleep:
+    // on 2026-09-01 it kicked sketchybar at 16:36:31, the Mac slept, and it woke
+    // at 16:47:59 still needing a kick -- but only ~11 seconds of *awake* time
+    // had passed, so the 60s cooldown had not expired and the fix was swallowed.
+    // The next tick was healthy again, so nothing ever retried: the bar stayed
+    // missing for 41 hours until a human noticed. The cooldown has to be counted
+    // on the same clock the health check itself uses -- wall time.
+    #[test]
+    fn a_sleep_longer_than_the_cooldown_is_still_fixed_on_the_next_wake() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let fixes = Arc::new(AtomicUsize::new(0));
+        let registry = counting_registry(&checks, &fixes);
+        let clock = FakeClock::new();
+
+        let monitor = spawn_with_clock(registry, "counting".into(), 1, Duration::from_secs(60), clock.as_clock());
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(fixes.load(Ordering::SeqCst), 1, "the first unhealthy tick must fix, and the one right after it must be suppressed");
+
+        // The Mac sleeps for ten minutes and wakes still unhealthy. Real time in
+        // this test moves by ~1.5s, so an `Instant`-based cooldown would still
+        // read ~1.5s elapsed and suppress the fix -- which is the bug.
+        clock.advance(Duration::from_secs(600));
+        thread::sleep(Duration::from_millis(1500));
+        monitor.stop();
+
+        assert_eq!(fixes.load(Ordering::SeqCst), 2, "a 10-minute sleep outlasts the 60s cooldown, so the tick after the wake must fix");
+    }
+
+    #[test]
+    fn fix_is_due_only_once_the_cooldown_has_actually_elapsed() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let cooldown = Duration::from_secs(60);
+
+        assert!(fix_is_due(None, base, cooldown), "a monitor that has never fixed must be allowed to");
+        assert!(!fix_is_due(Some(base), base + Duration::from_secs(59), cooldown));
+        assert!(fix_is_due(Some(base), base + Duration::from_secs(60), cooldown), "the boundary counts as elapsed");
+        assert!(fix_is_due(Some(base), base + Duration::from_secs(600), cooldown), "time the machine spent asleep counts too");
+    }
+
+    // NTP corrections and a user changing the clock can move wall time backwards,
+    // which makes "how long since the last fix" unanswerable. Fail open: fixing
+    // once too often is a nuisance, never fixing again is the outage above.
+    #[test]
+    fn a_backwards_clock_jump_lets_fix_run_rather_than_wedging_it_shut() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let jumped_back = base - Duration::from_secs(3600);
+        assert!(fix_is_due(Some(base), jumped_back, Duration::from_secs(60)));
     }
 
     #[test]
