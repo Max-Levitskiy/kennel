@@ -9,6 +9,14 @@ use crate::scheduler_manager::SchedulerManager;
 // daemon's own configured path, passed in here rather than accepted from a
 // client, so no socket peer can point the daemon at a directory of its choosing.
 pub fn serve(path: &Path, manager: Arc<SchedulerManager>, extensions_dir: PathBuf) -> std::io::Result<()> {
+    // Binding means unlinking whatever is at `path` first, so a second kenneld
+    // started by hand would silently steal the socket file from the running
+    // one: the LaunchAgent's daemon stays alive, keeps its now-unreachable
+    // listener, and every client gets ECONNREFUSED from the orphaned file
+    // while `launchctl list` still reports a healthy service. Refuse instead.
+    if UnixStream::connect(path).is_ok() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, format!("another kenneld is already serving {}", path.display())));
+    }
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     for stream in listener.incoming() {
@@ -194,6 +202,28 @@ mod tests {
             Response::Extensions(list) => assert_eq!(list.len(), 1),
             other => panic!("expected Extensions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_second_serve_refuses_instead_of_stealing_a_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("kennel.sock");
+
+        let first_manager = Arc::new(SchedulerManager::new(Registry::new(), dir.path().join("state.json")));
+        let serve_path = sock_path.clone();
+        let serve_extensions_dir = dir.path().join("extensions");
+        std::thread::spawn(move || { let _ = serve(&serve_path, first_manager, serve_extensions_dir); });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let second = Arc::new(SchedulerManager::new(Registry::new(), dir.path().join("state.json")));
+        let error = serve(&sock_path, second, dir.path().join("extensions")).expect_err("a second serve on a live socket must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+
+        // The point of refusing: the first daemon is still reachable.
+        let mut conn = UnixStream::connect(&sock_path).unwrap();
+        let mut reader = BufReader::new(conn.try_clone().unwrap());
+        send(&mut conn, &Request::List);
+        assert!(matches!(recv::<Response>(&mut reader), Response::Extensions(_)));
     }
 
     fn send(conn: &mut UnixStream, req: &Request) {

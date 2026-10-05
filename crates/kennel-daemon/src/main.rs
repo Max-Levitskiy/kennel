@@ -39,5 +39,8 @@ fn main() {
         std::fs::create_dir_all(parent).expect("create kennel support dir");
     }
     println!("kenneld listening on {}", sock_path.display());
-    socket::serve(&sock_path, manager, extensions_dir).expect("socket server crashed");
+    if let Err(e) = socket::serve(&sock_path, manager, extensions_dir) {
+        eprintln!("kenneld: {e}");
+        std::process::exit(1);
+    }
 }
