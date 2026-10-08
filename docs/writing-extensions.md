@@ -55,7 +55,7 @@ fn my_manifest() -> Manifest {
         description: "Warns when the startup disk has less than 10 GiB free",
         interval_secs: 300,
         capabilities: vec!["spawn", "notify", "log"],
-        privileged_commands: vec![],
+        ..Default::default()
     }
 }
 
@@ -98,6 +98,8 @@ mod tests {
     }
 }
 ```
+
+`..Default::default()` fills the optional fields (`privileged_commands`, `events`). Ending the literal with it keeps the crate compiling when the SDK adds optional fields.
 
 `kennel_extension!(manifest_fn, check_fn, fix_fn)` generates the exports the daemon calls. It defines functions named `manifest`, `check` and `fix` itself, so your own functions must be named something else (`my_check` and so on). Otherwise the build fails with `E0428: the name is defined multiple times`.
 
@@ -160,7 +162,7 @@ To see the unhealthy path, raise `MIN_FREE_GIB` above your free space, rebuild, 
 
 ## How kennel runs it
 
-- **Load.** At startup and on `Rescan`, the daemon goes through `extensions/<name>/`. A directory is loaded only if it holds both `manifest.toml` and `monitor.wasm`, the manifest parses, `interval_secs >= 1`, and the wasm's `manifest()` declares the same capabilities as `manifest.toml`. Anything else is skipped, and the reason is written to `kenneld.err.log`. A newly loaded extension stays disabled until someone enables it.
+- **Load.** At startup and on `Rescan`, the daemon goes through `extensions/<name>/`. A directory is loaded only if it holds both `manifest.toml` and `monitor.wasm`, the manifest parses, `interval_secs >= 1`, every event type's `example_payload` is valid JSON, and the wasm's `manifest()` declares the same capabilities and event types as `manifest.toml`. Anything else is skipped, and the reason is written to `kenneld.err.log`. A newly loaded extension stays disabled until someone enables it.
 - **Tick.** Every `interval_secs` the daemon calls `check()`. The result is published as the extension's status, which drives the GUI and `List`.
 - **Fix.** `fix()` runs only after `check()` returned `Unhealthy`, and then at most once per cooldown: 5 × `interval_secs`, but never less than 60 s. A 2 s extension can fix at most once a minute, and a 5 min one at most every 25 min. The cooldown resets when the daemon restarts or the extension is re-enabled.
 - **Fresh instance per call.** Every `check()` and `fix()` runs in a brand new wasm instance, so `static`s, globals and anything else in memory are gone by the next call. Use `host_state_get` / `host_state_set` to carry data between calls (gdrive-watchdog counts consecutive stalls this way).
@@ -179,11 +181,12 @@ To see the unhealthy path, raise `MIN_FREE_GIB` above your free space, rebuild, 
 | `interval_secs` | integer ≥ 1 | Seconds between `check()` calls. |
 | `capabilities` | array of strings | Host functions this extension may call. Defaults to `[]`. |
 | `privileged_commands` | array of strings | Absolute paths `privileged_spawn` may run as root. Defaults to `[]`. |
+| `[[events]]` | array of tables | Event types the extension may emit, each with `name`, `description` and `example_payload` (JSON text). Defaults to none. See [Emitting events](#emitting-events). |
 
 The manifest lives in two places: `manifest.toml` and the `Manifest` returned by your `my_manifest()`.
 
 - **`manifest.toml` decides what the extension gets.** It is the file the daemon grants capabilities from and the GUI shows the user.
-- **The wasm's copy is checked against it.** At load time the daemon checks that the two capability lists are the same set and refuses to load the extension if they're not. A capability you forgot in `manifest.toml` fails the load. It is never silently denied at runtime.
+- **The wasm's copy is checked against it.** At load time the daemon checks that the two capability lists are the same set, and that the two lists of event type names are the same set. It refuses to load the extension if either differs. A capability or event type you forgot in `manifest.toml` fails the load. It is never silently denied at runtime.
 - **Name, version and description are not cross-checked by the daemon.** The kennel-extensions release workflow does check that the tag, `Cargo.toml` and `manifest.toml` versions agree.
 
 ## Host API
@@ -200,6 +203,7 @@ All of these are in `kennel_guest_sdk`. A function whose capability isn't grante
 | `host_state_set(key, value)` | `state` | Writes it. Keys are sanitized to `[A-Za-z0-9_-]`. |
 | `host_notify(title, body)` | `notify` | Shows a macOS notification. |
 | `host_log(level, msg)` | `log` | Writes `[<name>] <level>: <msg>` to `kenneld.out.log`. `level` is free text (`info`, `warn`, …). |
+| `host_emit(event_type, id, payload_json) -> EmitResult` | `emit` | Emits an event from `check()`. See [Emitting events](#emitting-events). |
 | `host_now_unix_secs() -> u64` | none | Current wall-clock time. Always available, because wasm has no clock of its own. |
 
 `read_file` is a valid capability and the daemon implements it, but the SDK has no wrapper for it yet. Until it does, read files with `host_spawn("/bin/cat", &[path])`.
@@ -213,6 +217,62 @@ All of these are in `kennel_guest_sdk`. A function whose capability isn't grante
 `check` returns `Status::Healthy` or `Status::Unhealthy(String)`. The string is shown in the GUI, so make it say what's wrong ("only 4 GiB free on /"), not just "unhealthy".
 
 A check that would flap on one bad probe can require several failures in a row before reporting `Unhealthy`. Count them in `state`, like `gdrive-watchdog` and `sketchybar-watchdog` do.
+
+## Emitting events
+
+Besides reporting health, an extension can tell kennel that something happened: a meeting's notes are ready, a build finished, a file appeared. That is an **event**. The user attaches **subscriptions** to it, each one a shell command that kenneld runs when the event arrives (see [Subscriptions](usage.md#subscriptions-run-a-command-on-an-event)). The extension never sees or chooses those commands.
+
+**1. Declare the event types** in both copies of the manifest, and add the `emit` capability:
+
+```toml
+capabilities = ["emit"]
+
+[[events]]
+name = "note_ready"
+description = "A meeting's AI notes are ready"
+example_payload = '{"note_id": "n_123", "title": "Weekly sync"}'
+```
+
+```rust
+use kennel_guest_sdk::EventType;
+
+Manifest {
+    // ...
+    capabilities: vec!["emit"],
+    events: vec![EventType {
+        name: "note_ready",
+        description: "A meeting's AI notes are ready",
+        example_payload: r#"{"note_id": "n_123", "title": "Weekly sync"}"#,
+    }],
+    ..Default::default()
+}
+```
+
+The description and example payload are what the user sees when they write a command for the event, so make the example look like a real payload.
+
+**2. Emit from `check()`:**
+
+```rust
+use kennel_guest_sdk::{host_emit, EmitResult};
+
+for note in new_notes {
+    let payload = serde_json::json!({ "note_id": note.id, "title": note.title }).to_string();
+    host_emit("note_ready", &note.id, &payload);
+}
+```
+
+- **`id` identifies the occurrence.** kenneld keeps every id it has accepted from your extension and drops a repeat, so one note never starts a command twice. That holds across daemon restarts too. So re-emitting the last few items on every poll is safe and expected; you don't have to make your cursor crash-proof.
+- **`payload_json` must be JSON.** It is what each subscribed command reads on stdin.
+- **Only from `check()`.** An emit from `fix()` is rejected.
+- **`EmitResult`** is `Accepted`, `Duplicate` (already seen, dropped) or `Rejected`. An emit is rejected when:
+  - the `emit` capability isn't granted
+  - the event type isn't declared in `manifest.toml`
+  - the id is empty
+  - the payload isn't JSON, or is over 4 MiB
+
+  The reason goes to `kenneld.err.log`.
+
+Emitting is cheap: kenneld records the event and queues the subscribed commands, and `check()` doesn't wait for them to run.
 
 ## Publishing
 

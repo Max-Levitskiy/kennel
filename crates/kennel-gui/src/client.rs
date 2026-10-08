@@ -92,6 +92,7 @@ mod tests {
                     let resp = match req {
                         Request::List => Response::Extensions(vec![]),
                         Request::Enable { .. } | Request::Disable { .. } | Request::Rescan => Response::Ok,
+                        other => Response::Error { message: format!("fake server does not handle {other:?}") },
                     };
                     let mut out = serde_json::to_string(&resp).unwrap();
                     out.push('\n');

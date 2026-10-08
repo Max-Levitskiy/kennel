@@ -1,7 +1,7 @@
 use kennel_guest_sdk::{kennel_extension, Manifest, Status};
 
 fn my_manifest() -> Manifest {
-    Manifest { name: "always-healthy", version: "0.1.0", description: "test fixture", interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+    Manifest { name: "always-healthy", version: "0.1.0", description: "test fixture", interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
 }
 fn my_check() -> Status { Status::Healthy }
 fn my_fix() {}

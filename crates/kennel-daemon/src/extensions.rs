@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use kennel_proto::{Capability, ExtensionManifest};
+use kennel_proto::{Capability, EventType, ExtensionManifest};
 use crate::registry::Registry;
+use crate::events::EventSink;
 use crate::wasm_host::WasmPlugin;
 
 // I7: `interval_secs = 0` makes scheduler.rs's `while waited < interval_secs`
@@ -22,6 +23,8 @@ struct ManifestToml {
     capabilities: Vec<Capability>,
     #[serde(default)]
     privileged_commands: Vec<String>,
+    #[serde(default)]
+    events: Vec<EventType>,
 }
 
 // Scans `dir` for extensions and registers any that aren't registered yet,
@@ -29,7 +32,9 @@ struct ManifestToml {
 // an extension that is already registered is left completely alone -- its
 // existing plugin (and, if enabled, its running scheduler thread) must not be
 // disturbed by re-registration.
-pub fn scan_and_register(dir: &Path, registry: &Registry) -> Vec<String> {
+//
+// `event_sink` receives the events extensions emit from check().
+pub fn scan_and_register(dir: &Path, registry: &Registry, event_sink: Option<Arc<dyn EventSink>>) -> Vec<String> {
     let mut added = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return added };
     for entry in entries.flatten() {
@@ -45,6 +50,13 @@ pub fn scan_and_register(dir: &Path, registry: &Registry) -> Vec<String> {
                 continue;
             }
         };
+
+        // The example payload is piped to a command by Test, so it has to be
+        // real JSON; catching a typo here beats a confusing failed test run.
+        if let Some(bad) = parsed.events.iter().find(|e| serde_json::from_str::<serde_json::Value>(&e.example_payload).is_err()) {
+            eprintln!("skipping {}: event type {:?} has an example_payload that is not valid JSON", parsed.name, bad.name);
+            continue;
+        }
 
         if parsed.interval_secs < MIN_INTERVAL_SECS {
             eprintln!("skipping {}: interval_secs = {} is below the {MIN_INTERVAL_SECS}s minimum", parsed.name, parsed.interval_secs);
@@ -63,6 +75,7 @@ pub fn scan_and_register(dir: &Path, registry: &Registry) -> Vec<String> {
             interval_secs: parsed.interval_secs,
             capabilities: parsed.capabilities.clone(),
             privileged_commands: parsed.privileged_commands,
+            events: parsed.events,
         };
         let capabilities: HashSet<Capability> = parsed.capabilities.into_iter().collect();
         let data_dir = ext_dir.join("data");
@@ -82,7 +95,10 @@ pub fn scan_and_register(dir: &Path, registry: &Registry) -> Vec<String> {
         // manifest.toml -- see WasmPlugin::verify_guest_manifest) must not be
         // registered at all.
         let plugin = match WasmPlugin::load(&wasm_path, manifest.clone(), capabilities, data_dir) {
-            Ok(plugin) => plugin,
+            Ok(plugin) => match &event_sink {
+                Some(sink) => plugin.with_event_sink(sink.clone()),
+                None => plugin,
+            },
             Err(e) => {
                 eprintln!("skipping {}: {e}", manifest.name);
                 continue;
@@ -115,7 +131,7 @@ capabilities = []
         std::fs::copy(&wasm_src, ext_dir.join("monitor.wasm")).unwrap();
 
         let registry = Registry::new();
-        scan_and_register(dir.path(), &registry);
+        scan_and_register(dir.path(), &registry, None);
 
         let listed = registry.list();
         assert_eq!(listed.len(), 1);
@@ -157,7 +173,7 @@ capabilities = []
 
         let before = crate::wasm_host::engine_builds(name);
         let registry = Registry::new();
-        assert_eq!(scan_and_register(dir.path(), &registry), vec![name.to_string()]);
+        assert_eq!(scan_and_register(dir.path(), &registry, None), vec![name.to_string()]);
         assert_eq!(crate::wasm_host::engine_builds(name), before + 1, "the scan itself builds exactly one Engine");
 
         for _ in 0..10 {
@@ -179,13 +195,13 @@ capabilities = []
         write_extension(dir.path(), "first-extension", 1);
 
         let registry = Registry::new();
-        assert_eq!(scan_and_register(dir.path(), &registry), vec!["first-extension".to_string()]);
+        assert_eq!(scan_and_register(dir.path(), &registry, None), vec!["first-extension".to_string()]);
         registry.set_enabled("first-extension", true).unwrap();
         let builds_after_first_scan = crate::wasm_host::engine_builds("first-extension");
 
         // A second extension appears on disk (the GUI just installed it).
         write_extension(dir.path(), "second-extension", 1);
-        assert_eq!(scan_and_register(dir.path(), &registry), vec!["second-extension".to_string()], "a rescan must report only genuinely new extensions");
+        assert_eq!(scan_and_register(dir.path(), &registry, None), vec!["second-extension".to_string()], "a rescan must report only genuinely new extensions");
 
         let mut listed: Vec<_> = registry.list().into_iter().map(|e| (e.manifest.name, e.enabled)).collect();
         listed.sort();
@@ -204,7 +220,7 @@ capabilities = []
         write_extension(dir.path(), "busy-loop", 0);
 
         let registry = Registry::new();
-        assert!(scan_and_register(dir.path(), &registry).is_empty());
+        assert!(scan_and_register(dir.path(), &registry, None).is_empty());
         assert!(registry.list().is_empty(), "interval_secs = 0 busy-loops the scheduler and must never be registered");
     }
 
@@ -224,7 +240,26 @@ capabilities = []
         std::fs::copy(fixture_wasm_path(), ext_dir.join("monitor.wasm")).unwrap();
 
         let registry = Registry::new();
-        assert!(scan_and_register(dir.path(), &registry).is_empty());
+        assert!(scan_and_register(dir.path(), &registry, None).is_empty());
         assert!(registry.list().is_empty(), "a capability mismatch between manifest.toml and the wasm must fail the scan, not register silently");
+    }
+
+    // The load rule covers event types too: the always-healthy fixture declares
+    // none, this manifest.toml declares `ping`.
+    #[test]
+    fn an_extension_whose_event_types_disagree_with_its_wasm_is_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("mismatched-events");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("manifest.toml"),
+            "name = \"mismatched-events\"\nversion = \"0.1.0\"\ndescription = \"test\"\ninterval_secs = 1\ncapabilities = []\n\n[[events]]\nname = \"ping\"\ndescription = \"a ping\"\nexample_payload = '{\"n\": 1}'\n",
+        )
+        .unwrap();
+        std::fs::copy(fixture_wasm_path(), ext_dir.join("monitor.wasm")).unwrap();
+
+        let registry = Registry::new();
+        assert!(scan_and_register(dir.path(), &registry, None).is_empty());
+        assert!(registry.list().is_empty(), "an event-type mismatch between manifest.toml and the wasm must fail the scan");
     }
 }

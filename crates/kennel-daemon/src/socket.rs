@@ -3,12 +3,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use kennel_proto::{Request, Response};
+use crate::events::EventService;
 use crate::scheduler_manager::SchedulerManager;
 
 // `extensions_dir` is the directory Request::Rescan re-scans. It is the
 // daemon's own configured path, passed in here rather than accepted from a
 // client, so no socket peer can point the daemon at a directory of its choosing.
-pub fn serve(path: &Path, manager: Arc<SchedulerManager>, extensions_dir: PathBuf) -> std::io::Result<()> {
+pub fn serve(path: &Path, manager: Arc<SchedulerManager>, extensions_dir: PathBuf, events: EventService) -> std::io::Result<()> {
     // Binding means unlinking whatever is at `path` first, so a second kenneld
     // started by hand would silently steal the socket file from the running
     // one: the LaunchAgent's daemon stays alive, keeps its now-unreachable
@@ -23,19 +24,20 @@ pub fn serve(path: &Path, manager: Arc<SchedulerManager>, extensions_dir: PathBu
         let stream = stream?;
         let manager = manager.clone();
         let extensions_dir = extensions_dir.clone();
-        std::thread::spawn(move || handle_connection(stream, manager, extensions_dir));
+        let events = events.clone();
+        std::thread::spawn(move || handle_connection(stream, manager, extensions_dir, events));
     }
     Ok(())
 }
 
-fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>, extensions_dir: PathBuf) {
+fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>, extensions_dir: PathBuf, events: EventService) {
     let reader = BufReader::new(stream.try_clone().expect("clone unix stream"));
     let mut writer = stream;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() { continue; }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(&manager, req, &extensions_dir),
+            Ok(req) => handle_request(&manager, req, &extensions_dir, &events),
             Err(e) => Response::Error { message: format!("bad request: {e}") },
         };
         let mut out = serde_json::to_string(&response).expect("Response always serializes");
@@ -46,7 +48,7 @@ fn handle_connection(stream: UnixStream, manager: Arc<SchedulerManager>, extensi
     }
 }
 
-fn handle_request(manager: &SchedulerManager, req: Request, extensions_dir: &Path) -> Response {
+fn handle_request(manager: &SchedulerManager, req: Request, extensions_dir: &Path, events: &EventService) -> Response {
     match req {
         Request::List => Response::Extensions(manager.registry().list()),
         Request::Enable { name } => match manager.enable(&name, true) {
@@ -63,12 +65,41 @@ fn handle_request(manager: &SchedulerManager, req: Request, extensions_dir: &Pat
         // already-registered extensions (including enabled, actively ticking
         // ones) are left exactly as they are.
         Request::Rescan => {
-            let added = crate::extensions::scan_and_register(extensions_dir, manager.registry());
+            let added = crate::extensions::scan_and_register(extensions_dir, manager.registry(), Some(events.sink()));
             if !added.is_empty() {
                 println!("rescan registered {} new extension(s): {}", added.len(), added.join(", "));
             }
+            // Logged, not answered with an error: the extension scan above has
+            // already happened, and the GUI's install flow would report a broken
+            // subscriptions file as a failed install.
+            if let Err(message) = events.reload_subscriptions() {
+                eprintln!("rescan kept the previous subscriptions: {message}");
+            }
             Response::Ok
         }
+        Request::ListSubscriptions => Response::Subscriptions(events.list_subscriptions()),
+        Request::PutSubscription { subscription } => {
+            // Checked against what is installed now, to catch a typo in the
+            // extension or event name. A hand-edited subscriptions.toml isn't
+            // checked: its subscription just never matches anything.
+            let declared = manager.registry().list().into_iter().find(|e| e.manifest.name == subscription.extension);
+            match declared {
+                None => Response::Error { message: format!("unknown extension: {}", subscription.extension) },
+                Some(info) if !info.manifest.events.iter().any(|e| e.name == subscription.event) => Response::Error {
+                    message: format!("{} does not declare an event type named {:?}", subscription.extension, subscription.event),
+                },
+                Some(_) => match events.put_subscription(subscription) {
+                    Ok(saved) => Response::Subscription(saved),
+                    Err(message) => Response::Error { message },
+                },
+            }
+        }
+        Request::DeleteSubscription { id } => match events.delete_subscription(&id) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
+        Request::ListEvents => Response::Events(events.list_events()),
+        Request::ListRuns => Response::Runs(events.list_runs()),
     }
 }
 
@@ -84,7 +115,7 @@ mod tests {
     struct NoopPlugin;
     impl Plugin for NoopPlugin {
         fn manifest(&self) -> ExtensionManifest {
-            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
         }
         fn check(&mut self) -> MonitorStatus { MonitorStatus::Healthy }
         fn fix(&mut self) {}
@@ -98,7 +129,7 @@ mod tests {
 
         let registry = Registry::new();
         registry.register(
-            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] },
+            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] },
             Arc::new(|| Box::new(NoopPlugin) as Box<dyn Plugin>) as PluginFactory,
         );
         let manager = Arc::new(SchedulerManager::new(registry, state_path));
@@ -106,7 +137,8 @@ mod tests {
         let serve_path = sock_path.clone();
         let serve_manager = manager.clone();
         let serve_extensions_dir = dir.path().join("extensions");
-        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir); });
+        let serve_events = test_events(dir.path());
+        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir, serve_events); });
         std::thread::sleep(std::time::Duration::from_millis(200)); // let the listener bind
 
         let mut conn = UnixStream::connect(&sock_path).unwrap();
@@ -153,7 +185,8 @@ mod tests {
         let serve_path = sock_path.clone();
         let serve_manager = manager.clone();
         let serve_extensions_dir = extensions_dir.clone();
-        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir); });
+        let serve_events = test_events(dir.path());
+        std::thread::spawn(move || { let _ = serve(&serve_path, serve_manager, serve_extensions_dir, serve_events); });
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut conn = UnixStream::connect(&sock_path).unwrap();
@@ -212,11 +245,12 @@ mod tests {
         let first_manager = Arc::new(SchedulerManager::new(Registry::new(), dir.path().join("state.json")));
         let serve_path = sock_path.clone();
         let serve_extensions_dir = dir.path().join("extensions");
-        std::thread::spawn(move || { let _ = serve(&serve_path, first_manager, serve_extensions_dir); });
+        let serve_events = test_events(dir.path());
+        std::thread::spawn(move || { let _ = serve(&serve_path, first_manager, serve_extensions_dir, serve_events); });
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let second = Arc::new(SchedulerManager::new(Registry::new(), dir.path().join("state.json")));
-        let error = serve(&sock_path, second, dir.path().join("extensions")).expect_err("a second serve on a live socket must fail");
+        let error = serve(&sock_path, second, dir.path().join("extensions"), test_events(dir.path())).expect_err("a second serve on a live socket must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 
         // The point of refusing: the first daemon is still reachable.
@@ -224,6 +258,10 @@ mod tests {
         let mut reader = BufReader::new(conn.try_clone().unwrap());
         send(&mut conn, &Request::List);
         assert!(matches!(recv::<Response>(&mut reader), Response::Extensions(_)));
+    }
+
+    fn test_events(dir: &Path) -> EventService {
+        EventService::open(dir, Arc::new(crate::events::PlainShell))
     }
 
     fn send(conn: &mut UnixStream, req: &Request) {
