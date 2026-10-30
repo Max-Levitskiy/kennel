@@ -19,7 +19,7 @@ packaging/install.sh
 
 The script does the following:
 
-1. Builds `kenneld`, `kennel-gui` and `kennel-barprobe`.
+1. Builds `kenneld` and `kennel-gui`.
 2. Assembles `Kennel.app`.
 3. Registers two LaunchAgents:
    - `com.max.kenneld` is always kept running.
@@ -69,7 +69,7 @@ Enabled extensions stay enabled across the restart.
 
 | Path | What |
 |---|---|
-| `~/Applications/Kennel.app` | `kenneld`, `kennel-gui`, `kennel-barprobe` |
+| `~/Applications/Kennel.app` | `kenneld`, `kennel-gui` |
 | `~/Library/Application Support/kennel/extensions/<name>/` | `manifest.toml`, `monitor.wasm`, and `data/` (the extension's `state` storage) |
 | `~/Library/Application Support/kennel/state.json` | which extensions are enabled |
 | `~/Library/Application Support/kennel/gui-config.json` | store URLs |

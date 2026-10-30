@@ -36,7 +36,7 @@ fi
 step() { printf '\n==> %s\n' "$1"; }
 
 step "Building release binaries"
-(cd "$REPO" && cargo build --release -p kennel-daemon -p kennel-gui -p kennel-barprobe)
+(cd "$REPO" && cargo build --release -p kennel-daemon -p kennel-gui)
 
 step "Stopping anything already running"
 # Both agents go first: the bundle is about to be deleted from under them, and
@@ -79,15 +79,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 install -m 0755 "$REPO/target/release/kenneld" "$APP/Contents/MacOS/kenneld"
 install -m 0755 "$REPO/target/release/kennel-gui" "$APP/Contents/MacOS/kennel-gui"
-# sketchybar-watchdog spawns this to ask the window server whether a bar is
-# actually on screen; see sketchybar-watchdog in
-# https://github.com/Max-Levitskiy/kennel-extensions.
-install -m 0755 "$REPO/target/release/kennel-barprobe" "$APP/Contents/MacOS/kennel-barprobe"
-# kenneld is launched by launchd directly, and kennel-barprobe is exec'd by
-# kenneld, so both need a signature of their own rather than just the bundle
-# seal they would get as plain resources.
+# kenneld is launched by launchd directly, so it needs a signature of its own
+# rather than just the bundle seal it would get as a plain resource.
 codesign -f -s - "$APP/Contents/MacOS/kenneld"
-codesign -f -s - "$APP/Contents/MacOS/kennel-barprobe"
 codesign -f -s - "$APP"
 
 step "Registering LaunchAgents"
@@ -153,13 +147,6 @@ done
 if [[ "${reply:-}" != *'"Extensions"'* ]]; then
     echo "kenneld did not answer its control socket; see $LOGS/kenneld.err.log" >&2
     exit 1
-fi
-
-if summary="$("$APP/Contents/MacOS/kennel-barprobe" 2>/dev/null | head -1)"; then
-    echo "kennel-barprobe sees: $summary"
-else
-    echo "kennel-barprobe could not read the window server; sketchybar-watchdog will report" >&2
-    echo "  'cannot tell whether the bar is up' and will never restart anything." >&2
 fi
 
 if pgrep -qf "$APP/Contents/MacOS/kennel-gui"; then

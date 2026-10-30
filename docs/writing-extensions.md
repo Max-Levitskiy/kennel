@@ -204,6 +204,7 @@ All of these are in `kennel_guest_sdk`. A function whose capability isn't grante
 | `host_notify(title, body)` | `notify` | Shows a macOS notification. |
 | `host_log(level, msg)` | `log` | Writes `[<name>] <level>: <msg>` to `kenneld.out.log`. `level` is free text (`info`, `warn`, …). |
 | `host_emit(event_type, id, payload_json) -> EmitResult` | `emit` | Emits an event from `check()`. See [Emitting events](#emitting-events). |
+| `host_window_server(owner) -> Result<WindowServer, String>` | `window_server` | Active displays (bounds, built-in or not, and the kind of space each is showing: `Desktop`, `Fullscreen`, …) plus every window whose owner name equals `owner`, case-insensitive, with its bounds, layer and on-screen flag. `owner` is required, because the full window list is larger than the output limit below. |
 | `host_now_unix_secs() -> u64` | none | Current wall-clock time. Always available, because wasm has no clock of its own. |
 
 `read_file` is a valid capability and the daemon implements it, but the SDK has no wrapper for it yet. Until it does, read files with `host_spawn("/bin/cat", &[path])`.

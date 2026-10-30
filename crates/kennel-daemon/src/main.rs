@@ -9,6 +9,7 @@ mod scheduler_manager;
 mod socket;
 mod state;
 mod wasm_host;
+mod window_server;
 
 use std::path::PathBuf;
 use std::sync::Arc;
