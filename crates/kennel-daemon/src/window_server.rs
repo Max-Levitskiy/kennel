@@ -70,11 +70,21 @@ mod platform {
     use std::collections::HashMap;
     use std::ffi::c_void;
 
-    // Private SkyLight API, re-exported by CoreGraphics: the only way to read a display's current space.
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGSMainConnectionID() -> i32;
-        fn CGSCopyManagedDisplaySpaces(cid: i32) -> *const c_void;
+    // Private SkyLight API, the only way to read a display's current space. Looked
+    // up at runtime: a macOS without it must cost the space field, not kenneld's launch.
+    fn copy_managed_display_spaces() -> *const c_void {
+        type MainConnection = unsafe extern "C" fn() -> i32;
+        type CopySpaces = unsafe extern "C" fn(i32) -> *const c_void;
+        unsafe {
+            let main = libc::dlsym(libc::RTLD_DEFAULT, c"CGSMainConnectionID".as_ptr());
+            let copy = libc::dlsym(libc::RTLD_DEFAULT, c"CGSCopyManagedDisplaySpaces".as_ptr());
+            if main.is_null() || copy.is_null() {
+                return std::ptr::null();
+            }
+            let main: MainConnection = std::mem::transmute(main);
+            let copy: CopySpaces = std::mem::transmute(copy);
+            copy(main())
+        }
     }
     #[link(name = "ColorSync", kind = "framework")]
     extern "C" {
@@ -113,7 +123,7 @@ mod platform {
     // Current space type per display UUID, upper-cased. "Main" replaces the UUID
     // when "Displays have separate Spaces" is off.
     fn current_space_types() -> HashMap<String, i64> {
-        let raw = unsafe { CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) };
+        let raw = copy_managed_display_spaces();
         if raw.is_null() {
             return HashMap::new();
         }
@@ -219,5 +229,14 @@ mod tests {
     #[test]
     fn an_empty_owner_is_refused() {
         assert!(snapshot("").is_err());
+    }
+
+    // Needs a logged-in GUI session: `cargo test -p kennel-daemon -- --ignored`.
+    #[test]
+    #[ignore]
+    fn reads_every_displays_space_from_the_live_window_server() {
+        let s = snapshot("Dock").unwrap();
+        assert!(!s.displays.is_empty());
+        assert!(s.displays.iter().all(|d| d.space != "unknown"), "{:?}", s.displays);
     }
 }
