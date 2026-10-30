@@ -30,10 +30,7 @@ pub struct Display {
     pub id: u32,
     pub bounds: Rect,
     pub builtin: bool,
-    // The display is showing a native fullscreen space. macOS does not draw
-    // sketchybar there, so a missing bar is the expected state, not an outage --
-    // counting it as one restarted sketchybar every ~10s for as long as a window
-    // stayed fullscreen.
+    // macOS draws no sketchybar on a native fullscreen space.
     pub fullscreen: bool,
 }
 
@@ -76,9 +73,7 @@ pub struct DisplayVerdict {
     pub fullscreen: bool,
 }
 
-// The summary line's two counts: displays that should show a bar, and how many
-// of those do. Fullscreen displays are left out of both, so a caller that only
-// compares the two (sketchybar-watchdog does) never restarts over them.
+// Fullscreen displays are left out of both counts: sketchybar-watchdog compares only these two.
 pub fn summary(v: &[DisplayVerdict]) -> (usize, usize) {
     let expected: Vec<_> = v.iter().filter(|d| !d.fullscreen).collect();
     let with_bar = expected.iter().filter(|d| d.has_bar).count();
@@ -209,8 +204,6 @@ mod tests {
         assert!(!v[0].has_bar, "200px of 1512 is a leftover item, not a bar");
     }
 
-    // The reported loop: one display in a fullscreen space has no bar, which is
-    // how macOS draws it. It must drop out of the summary, not read as missing.
     #[test]
     fn a_fullscreen_display_without_a_bar_is_not_counted_as_missing() {
         let mut ds = vec![display(1, 0.0, 0.0, 1512.0, 982.0), display(2, -73.0, -1050.0, 1680.0, 1050.0)];
@@ -219,8 +212,6 @@ mod tests {
         assert_eq!(summary(&v), (1, 1));
     }
 
-    // Fullscreen excuses only its own display. The bar missing from a normal one
-    // next to it is still an outage.
     #[test]
     fn a_fullscreen_display_does_not_hide_a_missing_bar_elsewhere() {
         let mut ds = vec![display(1, 0.0, 0.0, 1512.0, 982.0), display(2, -73.0, -1050.0, 1680.0, 1050.0)];

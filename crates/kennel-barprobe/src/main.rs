@@ -3,8 +3,7 @@
 // Printed for kennel's sketchybar-watchdog to parse. First line is the machine
 // readable summary; the rest is detail for the log, so that when the bar goes
 // missing again there is a record of what the window server thought at the time.
-// A display showing a fullscreen space has no bar by design and is left out of
-// `displays`.
+// Displays on a fullscreen space have no bar by design and are left out of `displays`.
 //
 //   displays=2 with_bar=1 fullscreen=1
 //   display id=1 builtin=1 1512x982 coverage=99% bar=present
@@ -34,8 +33,7 @@ mod platform {
 
     use std::ffi::c_void;
 
-    // Private SkyLight calls, re-exported by CoreGraphics. They are the only way
-    // to ask which space a display is showing; yabai and AeroSpace rely on them.
+    // Private SkyLight API, re-exported by CoreGraphics: the only way to read a display's current space.
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGSMainConnectionID() -> i32;
@@ -51,7 +49,7 @@ mod platform {
         fn CFRelease(cf: *const c_void);
     }
 
-    // CGSSpaceType: 0 is a normal desktop, 4 a native fullscreen app.
+    // CGSSpaceType value for a native fullscreen space.
     const SPACE_TYPE_FULLSCREEN: i64 = 4;
 
     fn display_uuid(id: u32) -> Option<String> {
@@ -74,10 +72,8 @@ mod platform {
         Some(unsafe { CFDictionary::wrap_under_get_rule(d.as_concrete_TypeRef()) })
     }
 
-    // UUIDs of the displays whose current space is fullscreen. "Main" stands in
-    // for the main display's UUID when "Displays have separate Spaces" is off.
-    // Any failure here yields an empty list: the probe then behaves as it did
-    // before fullscreen was understood, never as if every display were excused.
+    // "Main" replaces the UUID when "Displays have separate Spaces" is off.
+    // Any failure returns an empty list, so no display is ever excused by mistake.
     fn fullscreen_display_uuids() -> Vec<String> {
         let raw = unsafe { CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) };
         if raw.is_null() {
@@ -206,8 +202,6 @@ fn main() {
 
     let v = verdict(&displays, &windows);
     let (expected, with_bar) = summary(&v);
-    // `displays` counts only displays that should show a bar, so callers that
-    // parse just the first two fields stay correct. `fullscreen` is informational.
     println!("displays={} with_bar={} fullscreen={}", expected, with_bar, v.len() - expected);
     for d in &v {
         println!(
