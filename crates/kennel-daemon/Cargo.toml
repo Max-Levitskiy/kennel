@@ -12,7 +12,7 @@ kennel-proto = { path = "../kennel-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-wasmtime = "24"
+wasmtime = "50"
 libc = "0.2"
 
 [dev-dependencies]
