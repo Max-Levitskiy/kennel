@@ -3,10 +3,12 @@
 // Printed for kennel's sketchybar-watchdog to parse. First line is the machine
 // readable summary; the rest is detail for the log, so that when the bar goes
 // missing again there is a record of what the window server thought at the time.
+// Displays on a fullscreen space have no bar by design and are left out of `displays`.
 //
-//   displays=2 with_bar=1
+//   displays=2 with_bar=1 fullscreen=1
 //   display id=1 builtin=1 1512x982 coverage=99% bar=present
 //   display id=2 builtin=0 1680x1050 coverage=0% bar=MISSING
+//   display id=3 builtin=0 2560x1440 coverage=0% bar=fullscreen
 //
 // Exit codes are the important contract: 0 means "the probe ran and the summary
 // is trustworthy" (whether or not a bar is missing), and 2 means "the probe could
@@ -15,7 +17,7 @@
 
 mod verdict;
 
-use verdict::{verdict, Display, Rect, Window};
+use verdict::{summary, verdict, Display, Rect, Window};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -29,8 +31,76 @@ mod platform {
     use core_graphics::display::CGDisplay;
     use core_graphics::window::{copy_window_info, kCGWindowListOptionAll};
 
+    use std::ffi::c_void;
+
+    // Private SkyLight API, re-exported by CoreGraphics: the only way to read a display's current space.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSMainConnectionID() -> i32;
+        fn CGSCopyManagedDisplaySpaces(cid: i32) -> *const c_void;
+    }
+    #[link(name = "ColorSync", kind = "framework")]
+    extern "C" {
+        fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFUUIDCreateString(alloc: *const c_void, uuid: *const c_void) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    // CGSSpaceType value for a native fullscreen space.
+    const SPACE_TYPE_FULLSCREEN: i64 = 4;
+
+    fn display_uuid(id: u32) -> Option<String> {
+        unsafe {
+            let uuid = CGDisplayCreateUUIDFromDisplayID(id);
+            if uuid.is_null() {
+                return None;
+            }
+            let s = CFUUIDCreateString(std::ptr::null(), uuid);
+            CFRelease(uuid);
+            if s.is_null() {
+                return None;
+            }
+            Some(CFString::wrap_under_create_rule(s as _).to_string())
+        }
+    }
+
+    fn as_dict(v: CFType) -> Option<CFDictionary<CFString, CFType>> {
+        let d = v.downcast::<CFDictionary>()?;
+        Some(unsafe { CFDictionary::wrap_under_get_rule(d.as_concrete_TypeRef()) })
+    }
+
+    // "Main" replaces the UUID when "Displays have separate Spaces" is off.
+    // Any failure returns an empty list, so no display is ever excused by mistake.
+    fn fullscreen_display_uuids() -> Vec<String> {
+        let raw = unsafe { CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) };
+        if raw.is_null() {
+            return Vec::new();
+        }
+        let arr: CFArray<CFDictionary<CFString, CFType>> = unsafe { CFArray::wrap_under_create_rule(raw as _) };
+        let mut out = Vec::new();
+        for entry in arr.iter() {
+            let ident = match get(&entry, "Display Identifier").and_then(|v| v.downcast::<CFString>()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let space_type = get(&entry, "Current Space")
+                .and_then(as_dict)
+                .and_then(|space| get(&space, "type"))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_i64());
+            if space_type == Some(SPACE_TYPE_FULLSCREEN) {
+                out.push(if ident == "Main" { display_uuid(CGDisplay::main().id).unwrap_or(ident) } else { ident });
+            }
+        }
+        out
+    }
+
     pub fn displays() -> Result<Vec<Display>, String> {
         let ids = CGDisplay::active_displays().map_err(|e| format!("CGGetActiveDisplayList failed: {e:?}"))?;
+        let fullscreen = fullscreen_display_uuids();
         Ok(ids
             .into_iter()
             .map(|id| {
@@ -40,6 +110,7 @@ mod platform {
                     id,
                     bounds: Rect { x: b.origin.x, y: b.origin.y, w: b.size.width, h: b.size.height },
                     builtin: d.is_builtin(),
+                    fullscreen: display_uuid(id).is_some_and(|u| fullscreen.iter().any(|f| f.eq_ignore_ascii_case(&u))),
                 }
             })
             .collect())
@@ -130,8 +201,8 @@ fn main() {
     }
 
     let v = verdict(&displays, &windows);
-    let with_bar = v.iter().filter(|d| d.has_bar).count();
-    println!("displays={} with_bar={}", v.len(), with_bar);
+    let (expected, with_bar) = summary(&v);
+    println!("displays={} with_bar={} fullscreen={}", expected, with_bar, v.len() - expected);
     for d in &v {
         println!(
             "display id={} builtin={} {:.0}x{:.0} coverage={:.0}% bar={}",
@@ -140,7 +211,13 @@ fn main() {
             d.width,
             d.height,
             d.coverage * 100.0,
-            if d.has_bar { "present" } else { "MISSING" }
+            if d.fullscreen {
+                "fullscreen"
+            } else if d.has_bar {
+                "present"
+            } else {
+                "MISSING"
+            }
         );
     }
 }

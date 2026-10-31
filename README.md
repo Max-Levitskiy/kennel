@@ -44,7 +44,7 @@ extensions and state to `~/Library/Application Support/kennel`.
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown -p always-healthy -p unhealthy-then-fixed -p panics -p hangs
+cargo build --release --target wasm32-unknown-unknown -p always-healthy -p unhealthy-then-fixed -p panics -p hangs -p emits-events
 cargo test --workspace
 ```
 

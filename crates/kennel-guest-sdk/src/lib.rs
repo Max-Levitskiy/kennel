@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
+// `Default` so a manifest can end in `..Default::default()` and stay
+// source-compatible as optional fields are added.
+#[derive(Serialize, Default)]
 pub struct Manifest {
     pub name: &'static str,
     pub version: &'static str,
@@ -8,6 +10,17 @@ pub struct Manifest {
     pub interval_secs: u64,
     pub capabilities: Vec<&'static str>,
     pub privileged_commands: Vec<&'static str>,
+    pub events: Vec<EventType>,
+}
+
+// An event type the extension may emit with `host_emit`. Must match a
+// `[[events]]` entry in manifest.toml by name, or the extension won't load.
+// `example_payload` is JSON text.
+#[derive(Serialize, Default)]
+pub struct EventType {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub example_payload: &'static str,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +53,20 @@ extern "C" {
     fn write_file(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;
     fn log(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32);
     fn now() -> u64;
+    fn emit(type_ptr: i32, type_len: i32, id_ptr: i32, id_len: i32, payload_ptr: i32, payload_len: i32) -> i32;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitResult {
+    // kenneld recorded the event and queued the subscriptions on it.
+    Accepted,
+    // kenneld already accepted an event with this id from this extension, so
+    // it was dropped. Re-emitting recent items on every poll is expected.
+    Duplicate,
+    // Not recorded: no `emit` capability, an undeclared event type, an empty
+    // id, a payload that isn't JSON, or emitted outside check(). The reason is
+    // in kenneld's error log.
+    Rejected,
 }
 
 pub fn host_write_file(path: &str, data: &[u8]) -> bool {
@@ -55,6 +82,28 @@ pub fn host_log(level: &str, msg: &str) {
 // (no WASI here), so this is the only way guest code can ever get wall-clock time.
 pub fn host_now_unix_secs() -> u64 {
     unsafe { now() }
+}
+
+// Emits an event from check(): `event_type` must be declared in the manifest,
+// `id` identifies the occurrence (kenneld drops ids it has already accepted
+// from this extension) and `payload_json` is what subscribed commands get on
+// stdin.
+pub fn host_emit(event_type: &str, id: &str, payload_json: &str) -> EmitResult {
+    let code = unsafe {
+        emit(
+            event_type.as_ptr() as i32,
+            event_type.len() as i32,
+            id.as_ptr() as i32,
+            id.len() as i32,
+            payload_json.as_ptr() as i32,
+            payload_json.len() as i32,
+        )
+    };
+    match code {
+        1 => EmitResult::Accepted,
+        2 => EmitResult::Duplicate,
+        _ => EmitResult::Rejected,
+    }
 }
 
 #[link(wasm_import_module = "kennel")]

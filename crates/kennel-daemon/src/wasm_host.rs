@@ -6,9 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use kennel_proto::{Capability, ExtensionManifest, MonitorStatus};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
+use crate::events::{EmitOutcome, EventSink};
 
 // Matches kennel_guest_sdk::SCRATCH_LEN -- the fixed size of the guest's scratch buffer.
 const SCRATCH_LEN: usize = 65536;
+
+// Largest event payload `emit` accepts. Guest memory bounds it anyway; this
+// keeps one event from bloating events.jsonl.
+const MAX_EVENT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 // How often the per-engine ticker thread advances wasmtime's epoch counter.
 const EPOCH_TICK: Duration = Duration::from_millis(100);
@@ -35,6 +40,11 @@ struct HostCtx {
     // `kennel_support_dir` / `is_inside`.
     protected_dir: Option<PathBuf>,
     scratch_ptr: i32,
+    // Event types declared in manifest.toml; `emit` rejects anything else.
+    event_types: HashSet<String>,
+    event_sink: Option<Arc<dyn EventSink>>,
+    // Only check() emits. False for fix() and for the load-time manifest() call.
+    emit_allowed: bool,
 }
 
 // Stops the epoch ticker thread once the last clone of a WasmPlugin is dropped.
@@ -88,6 +98,7 @@ pub struct WasmPlugin {
     capabilities: HashSet<Capability>,
     data_dir: PathBuf,
     protected_dir: Option<PathBuf>,
+    event_sink: Option<Arc<dyn EventSink>>,
     // Shared by every clone; the ticker thread stops when the last one drops.
     _ticker: Arc<EngineTicker>,
 }
@@ -129,10 +140,18 @@ impl WasmPlugin {
             capabilities,
             data_dir,
             protected_dir: kennel_support_dir(),
+            event_sink: None,
             _ticker: Arc::new(EngineTicker { stop }),
         };
         plugin.verify_guest_manifest()?;
         Ok(plugin)
+    }
+
+    // Where events this extension emits from check() go. Without one, `emit`
+    // rejects everything.
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
     }
 
     // Test seam: point the `write_file` deny-list at a stand-in for
@@ -160,7 +179,7 @@ impl WasmPlugin {
     // reach any gated host import. (It is still bounded by the usual epoch
     // deadline, so a manifest() that spins just fails the load.)
     fn verify_guest_manifest(&self) -> Result<(), String> {
-        let (mut store, instance) = self.instantiate(HashSet::new())?;
+        let (mut store, instance) = self.instantiate(HashSet::new(), false)?;
         let manifest_fn = instance
             .get_typed_func::<(), u64>(&mut store, "manifest")
             .map_err(|e| format!("guest does not export manifest() (built without kennel_guest_sdk's kennel_extension! macro?): {e}"))?;
@@ -171,27 +190,28 @@ impl WasmPlugin {
         struct GuestManifest {
             #[serde(default)]
             capabilities: Vec<String>,
+            // Absent from manifests built with an SDK older than events.
+            #[serde(default)]
+            events: Vec<GuestEventType>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GuestEventType {
+            name: String,
         }
         let guest: GuestManifest = serde_json::from_str(&json).map_err(|e| format!("guest manifest() returned unparseable JSON: {e}"))?;
 
-        let declared: std::collections::BTreeSet<String> = guest.capabilities.into_iter().collect();
-        let granted: std::collections::BTreeSet<String> = self.manifest.capabilities.iter().map(capability_name).collect();
-        if declared != granted {
-            return Err(format!(
-                "capability mismatch for {}: manifest.toml grants {:?} but the wasm's own manifest() declares {:?}",
-                self.manifest.name,
-                granted.into_iter().collect::<Vec<_>>(),
-                declared.into_iter().collect::<Vec<_>>(),
-            ));
-        }
-        Ok(())
+        // Same rule for event types as for capabilities: a subscription is made
+        // against manifest.toml's list, so the code must emit exactly that.
+        let name = &self.manifest.name;
+        same_set(&format!("event type mismatch for {name}: manifest.toml declares"), self.manifest.events.iter().map(|e| e.name.clone()), guest.events.into_iter().map(|e| e.name))?;
+        same_set(&format!("capability mismatch for {name}: manifest.toml grants"), self.manifest.capabilities.iter().map(capability_name), guest.capabilities)
     }
 
-    fn fresh_instance(&self) -> Result<(Store<HostCtx>, Instance), String> {
-        self.instantiate(self.capabilities.clone())
+    fn fresh_instance(&self, emit_allowed: bool) -> Result<(Store<HostCtx>, Instance), String> {
+        self.instantiate(self.capabilities.clone(), emit_allowed)
     }
 
-    fn instantiate(&self, capabilities: HashSet<Capability>) -> Result<(Store<HostCtx>, Instance), String> {
+    fn instantiate(&self, capabilities: HashSet<Capability>, emit_allowed: bool) -> Result<(Store<HostCtx>, Instance), String> {
         let mut linker: Linker<HostCtx> = Linker::new(&self.engine);
         register_host_imports(&mut linker);
 
@@ -202,6 +222,9 @@ impl WasmPlugin {
             data_dir: self.data_dir.clone(),
             protected_dir: self.protected_dir.clone(),
             scratch_ptr: 0,
+            event_types: self.manifest.events.iter().map(|e| e.name.clone()).collect(),
+            event_sink: self.event_sink.clone(),
+            emit_allowed,
         };
         let mut store = Store::new(&self.engine, ctx);
         store.set_epoch_deadline((GUEST_CALL_DEADLINE.as_millis() / EPOCH_TICK.as_millis()) as u64);
@@ -243,7 +266,7 @@ impl crate::plugin::Plugin for WasmPlugin {
     }
 
     fn check(&mut self) -> MonitorStatus {
-        let (mut store, instance) = match self.fresh_instance() {
+        let (mut store, instance) = match self.fresh_instance(true) {
             Ok(pair) => pair,
             Err(e) => return MonitorStatus::Errored { detail: e },
         };
@@ -270,11 +293,22 @@ impl crate::plugin::Plugin for WasmPlugin {
     }
 
     fn fix(&mut self) {
-        let Ok((mut store, instance)) = self.fresh_instance() else { return };
+        let Ok((mut store, instance)) = self.fresh_instance(false) else { return };
         if let Ok(fix_fn) = instance.get_typed_func::<(), ()>(&mut store, "fix") {
             let _ = fix_fn.call(&mut store, ());
         }
     }
+}
+
+// Err when the two lists differ as sets: "<what> [..] but the wasm's own
+// manifest() declares [..]".
+fn same_set(what: &str, listed: impl IntoIterator<Item = String>, declared: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let listed: std::collections::BTreeSet<String> = listed.into_iter().collect();
+    let declared: std::collections::BTreeSet<String> = declared.into_iter().collect();
+    if listed == declared {
+        return Ok(());
+    }
+    Err(format!("{what} {:?} but the wasm's own manifest() declares {:?}", listed.into_iter().collect::<Vec<_>>(), declared.into_iter().collect::<Vec<_>>()))
 }
 
 fn require_capability(caller: &Caller<'_, HostCtx>, cap: Capability) -> bool {
@@ -533,6 +567,51 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let _ = std::fs::write(&path, &buf);
     }).expect("register state_set");
 
+    // Returns 1 when the event was accepted, 2 when kenneld already had that id
+    // from this extension, 0 when it was rejected (reason in the error log).
+    linker.func_wrap("kennel", "emit", |mut caller: Caller<'_, HostCtx>, type_ptr: i32, type_len: i32, id_ptr: i32, id_len: i32, payload_ptr: i32, payload_len: i32| -> i32 {
+        let extension = caller.data().extension_name.clone();
+        if !require_capability(&caller, Capability::Emit) {
+            eprintln!("[{extension}] emit denied: the emit capability is not granted");
+            return 0;
+        }
+        if !caller.data().emit_allowed {
+            eprintln!("[{extension}] emit rejected: events can only be emitted from check()");
+            return 0;
+        }
+        let event_type = read_str(&mut caller, type_ptr, type_len);
+        if !caller.data().event_types.contains(&event_type) {
+            eprintln!("[{extension}] emit rejected: event type {event_type:?} is not declared in manifest.toml");
+            return 0;
+        }
+        let id = read_str(&mut caller, id_ptr, id_len);
+        if id.is_empty() {
+            eprintln!("[{extension}] emit rejected: {event_type} event has an empty id");
+            return 0;
+        }
+        if payload_len as u32 as usize > MAX_EVENT_PAYLOAD_BYTES {
+            eprintln!("[{extension}] emit rejected: {event_type}/{id} payload is over {MAX_EVENT_PAYLOAD_BYTES} bytes");
+            return 0;
+        }
+        let Some(bytes) = read_bytes(&mut caller, payload_ptr, payload_len) else { return 0 };
+        let payload = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("[{extension}] emit rejected: {event_type}/{id} payload is not JSON: {e}");
+                return 0;
+            }
+        };
+        let Some(sink) = caller.data().event_sink.clone() else {
+            eprintln!("[{extension}] emit rejected: this daemon has no event service");
+            return 0;
+        };
+        match sink.accept(&extension, &event_type, &id, payload) {
+            EmitOutcome::Accepted => 1,
+            EmitOutcome::Duplicate => 2,
+            EmitOutcome::NotRecorded => 0,
+        }
+    }).expect("register emit");
+
     // Deliberately NOT capability-gated, unlike every other import above: wall-clock
     // time isn't a meaningful security boundary for a personal single-user tool the
     // way spawning processes or touching files is (there's nothing to protect by
@@ -629,7 +708,7 @@ mod tests {
     }
 
     fn test_manifest_with_caps(name: &str, capabilities: &[Capability]) -> ExtensionManifest {
-        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: capabilities.to_vec(), privileged_commands: vec![] }
+        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: capabilities.to_vec(), privileged_commands: vec![], events: vec![] }
     }
 
     #[test]
@@ -939,6 +1018,84 @@ mod tests {
         // host import tested above.
         let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("now-plausible"), HashSet::new(), dir.path().to_path_buf()).unwrap();
         assert_eq!(plugin.check(), MonitorStatus::Healthy, "now() should return a real, recent-ish wall-clock value with no capability granted");
+    }
+
+    // Records what reaches the event service.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<String>>);
+    impl EventSink for RecordingSink {
+        fn accept(&self, _extension: &str, event: &str, id: &str, _payload: serde_json::Value) -> EmitOutcome {
+            self.0.lock().unwrap().push(format!("{event}/{id}"));
+            EmitOutcome::Accepted
+        }
+    }
+
+    // Emits ping/evt-1 with a valid JSON payload from both check() and fix(),
+    // and declares `ping` in its manifest(), so the only things that can stop
+    // the emit are the capability and the check()-only gates.
+    fn emit_fixture_wat(capabilities: &[&str]) -> String {
+        let caps = capabilities.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let manifest = format!("{{\"name\":\"emit-gate\",\"version\":\"0.1.0\",\"description\":\"\",\"interval_secs\":1,\"capabilities\":[{caps}],\"privileged_commands\":[],\"events\":[{{\"name\":\"ping\",\"description\":\"\",\"example_payload\":\"{{}}\"}}]}}");
+        let healthy = "{\"kind\":\"Healthy\"}";
+        format!(
+            r#"(module
+  (import "kennel" "emit" (func $emit (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ping")
+  (data (i32.const 16) "evt-1")
+  (data (i32.const 32) "{{}}")
+  (data (i32.const 4096) "{healthy_wat}")
+  (data (i32.const 6000) "{manifest_wat}")
+  (func (export "manifest") (result i64)
+    (i64.or (i64.shl (i64.extend_i32_u (i32.const 6000)) (i64.const 32)) (i64.extend_i32_u (i32.const {manifest_len}))))
+  (func (export "__kennel_scratch_ptr") (result i32) i32.const 8192)
+  (func (export "check") (result i64)
+    (drop (call $emit (i32.const 0) (i32.const 4) (i32.const 16) (i32.const 5) (i32.const 32) (i32.const 2)))
+    (i64.or (i64.shl (i64.extend_i32_u (i32.const 4096)) (i64.const 32)) (i64.extend_i32_u (i32.const {healthy_len}))))
+  (func (export "fix")
+    (drop (call $emit (i32.const 0) (i32.const 4) (i32.const 16) (i32.const 5) (i32.const 32) (i32.const 2)))))
+"#,
+            healthy_wat = wat_escape(healthy),
+            healthy_len = healthy.len(),
+            manifest_wat = wat_escape(&manifest),
+            manifest_len = manifest.len(),
+        )
+    }
+
+    fn emit_gate_plugin(dir: &Path, capabilities: &[Capability], sink: Arc<RecordingSink>) -> WasmPlugin {
+        let names: Vec<String> = capabilities.iter().map(capability_name).collect();
+        let wat = emit_fixture_wat(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let wasm_path = write_wat_fixture(dir, &wat);
+        let mut manifest = test_manifest_with_caps("emit-gate", capabilities);
+        manifest.events = vec![kennel_proto::EventType { name: "ping".into(), description: String::new(), example_payload: "{}".into() }];
+        WasmPlugin::load(&wasm_path, manifest, capabilities.iter().copied().collect(), dir.to_path_buf()).unwrap().with_event_sink(sink)
+    }
+
+    #[test]
+    fn emit_reaches_the_event_sink_from_check_with_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut plugin = emit_gate_plugin(dir.path(), &[Capability::Emit], sink.clone());
+        assert_eq!(plugin.check(), MonitorStatus::Healthy);
+        assert_eq!(*sink.0.lock().unwrap(), vec!["ping/evt-1"]);
+    }
+
+    #[test]
+    fn emit_is_denied_without_the_emit_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut plugin = emit_gate_plugin(dir.path(), &[], sink.clone());
+        assert_eq!(plugin.check(), MonitorStatus::Healthy, "a denied emit returns cleanly, it doesn't trap");
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn emit_from_fix_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut plugin = emit_gate_plugin(dir.path(), &[Capability::Emit], sink.clone());
+        plugin.fix();
+        assert!(sink.0.lock().unwrap().is_empty(), "only check() emits");
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub struct Display {
     pub id: u32,
     pub bounds: Rect,
     pub builtin: bool,
+    // macOS draws no sketchybar on a native fullscreen space.
+    pub fullscreen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,14 @@ pub struct DisplayVerdict {
     pub height: f64,
     pub coverage: f64,
     pub has_bar: bool,
+    pub fullscreen: bool,
+}
+
+// Fullscreen displays are left out of both counts: sketchybar-watchdog compares only these two.
+pub fn summary(v: &[DisplayVerdict]) -> (usize, usize) {
+    let expected: Vec<_> = v.iter().filter(|d| !d.fullscreen).collect();
+    let with_bar = expected.iter().filter(|d| d.has_bar).count();
+    (expected.len(), with_bar)
 }
 
 // Widest sketchybar window overlapping the display, as a fraction of the
@@ -96,6 +106,7 @@ pub fn verdict(displays: &[Display], windows: &[Window]) -> Vec<DisplayVerdict> 
                 height: d.bounds.h,
                 coverage: c,
                 has_bar: c >= MIN_COVERAGE,
+                fullscreen: d.fullscreen,
             }
         })
         .collect()
@@ -106,7 +117,7 @@ mod tests {
     use super::*;
 
     fn display(id: u32, x: f64, y: f64, w: f64, h: f64) -> Display {
-        Display { id, bounds: Rect { x, y, w, h }, builtin: id == 1 }
+        Display { id, bounds: Rect { x, y, w, h }, builtin: id == 1, fullscreen: false }
     }
 
     fn bar_on(d: &Display) -> Window {
@@ -191,5 +202,20 @@ mod tests {
         let ws = vec![Window { owner: "sketchybar".into(), bounds: Rect { x: 0.0, y: 4.0, w: 200.0, h: 39.0 }, onscreen: true }];
         let v = verdict(&ds, &ws);
         assert!(!v[0].has_bar, "200px of 1512 is a leftover item, not a bar");
+    }
+
+    #[test]
+    fn a_fullscreen_display_without_a_bar_is_not_counted_as_missing() {
+        let mut ds = vec![display(1, 0.0, 0.0, 1512.0, 982.0), display(2, -73.0, -1050.0, 1680.0, 1050.0)];
+        ds[0].fullscreen = true;
+        let v = verdict(&ds, &[bar_on(&ds[1])]);
+        assert_eq!(summary(&v), (1, 1));
+    }
+
+    #[test]
+    fn a_fullscreen_display_does_not_hide_a_missing_bar_elsewhere() {
+        let mut ds = vec![display(1, 0.0, 0.0, 1512.0, 982.0), display(2, -73.0, -1050.0, 1680.0, 1050.0)];
+        ds[0].fullscreen = true;
+        assert_eq!(summary(&verdict(&ds, &[])), (1, 0));
     }
 }

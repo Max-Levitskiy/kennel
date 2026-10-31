@@ -92,7 +92,7 @@ mod tests {
     }
     impl Plugin for CountingPlugin {
         fn manifest(&self) -> ExtensionManifest {
-            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
         }
         fn check(&mut self) -> MonitorStatus {
             self.checks.fetch_add(1, Ordering::SeqCst);
@@ -102,7 +102,7 @@ mod tests {
     }
 
     fn manifest() -> ExtensionManifest {
-        ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![] }
+        ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
     }
 
     #[test]
