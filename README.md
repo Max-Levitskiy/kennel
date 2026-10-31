@@ -24,7 +24,6 @@ window lists installed extensions and installs new ones from an extension index.
 | `crates/kennel-gui` | menu bar app and extension store |
 | `crates/kennel-guest-sdk` | what extensions link against (`kennel_extension!` macro, host imports) |
 | `crates/kennel-proto` | wire types shared by daemon and GUI |
-| `crates/kennel-barprobe` | asks the window server whether sketchybar is on every display |
 | `fixtures/` | test extensions used by the daemon's tests |
 
 Extensions live in [kennel-extensions](https://github.com/Max-Levitskiy/kennel-extensions),

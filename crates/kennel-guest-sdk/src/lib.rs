@@ -158,6 +158,77 @@ pub fn host_launchctl(action: &str, args: &[&str]) {
     unsafe { launchctl(action.as_ptr() as i32, action.len() as i32, args_json.as_ptr() as i32, args_json.len() as i32) }
 }
 
+#[link(wasm_import_module = "kennel")]
+extern "C" {
+    fn window_server(owner_ptr: i32, owner_len: i32) -> u64;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Rect {
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.x + other.w && other.x < self.x + self.w && self.y < other.y + other.h && other.y < self.y + self.h
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Space {
+    Desktop,
+    Fullscreen,
+    // The window server did not say which space the display is showing.
+    Unknown,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Display {
+    pub id: u32,
+    pub uuid: String,
+    pub bounds: Rect,
+    pub builtin: bool,
+    pub space: Space,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub owner: String,
+    pub bounds: Rect,
+    pub onscreen: bool,
+    pub layer: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowServer {
+    pub displays: Vec<Display>,
+    pub windows: Vec<Window>,
+}
+
+// Active displays plus the windows whose owner name equals `owner`
+// (case-insensitive). The owner filter keeps the reply inside the scratch buffer.
+pub fn host_window_server(owner: &str) -> Result<WindowServer, String> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Reply {
+        Ok(WindowServer),
+        Err { error: String },
+    }
+    let packed = unsafe { window_server(owner.as_ptr() as i32, owner.len() as i32) };
+    let (ptr, len) = unpack(packed);
+    match serde_json::from_str(&read_from_scratch(ptr, len)) {
+        Ok(Reply::Ok(snapshot)) => Ok(snapshot),
+        Ok(Reply::Err { error }) => Err(error),
+        Err(e) => Err(format!("bad host response: {e}")),
+    }
+}
+
 // Note: `read_from_scratch`'s pointer-subtraction trick only works because the host
 // always writes into the *same* static `SCRATCH` buffer the guest itself owns
 // (Task 8's `write_scratch` writes at the address the guest reported via

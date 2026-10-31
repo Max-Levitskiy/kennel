@@ -16,6 +16,7 @@ pub enum Capability {
     Log,
     Notify,
     Emit,
+    WindowServer,
 }
 
 // An event type an extension may emit, declared up front so a subscription can

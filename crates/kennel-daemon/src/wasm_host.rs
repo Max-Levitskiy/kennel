@@ -518,6 +518,22 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
         let _ = run_with_timeout(command, HOST_COMMAND_TIMEOUT);
     }).expect("register launchctl");
 
+    linker.func_wrap("kennel", "window_server", |mut caller: Caller<'_, HostCtx>, owner_ptr: i32, owner_len: i32| -> u64 {
+        if !require_capability(&caller, Capability::WindowServer) { return write_scratch(&mut caller, b"{\"error\":\"capability not granted\"}"); }
+        let owner = read_str(&mut caller, owner_ptr, owner_len);
+        let result = match crate::window_server::snapshot(&owner) {
+            Ok(s) => serde_json::to_string(&s).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        };
+        // Truncated JSON would not parse anyway; say why instead.
+        let result = if result.len() > SCRATCH_LEN {
+            serde_json::json!({ "error": format!("{} bytes of windows for {owner:?}, over the {SCRATCH_LEN}-byte host buffer", result.len()) }).to_string()
+        } else {
+            result
+        };
+        write_scratch(&mut caller, result.as_bytes())
+    }).expect("register window_server");
+
     linker.func_wrap("kennel", "read_file", |mut caller: Caller<'_, HostCtx>, path_ptr: i32, path_len: i32| -> u64 {
         if !require_capability(&caller, Capability::ReadFile) { return write_scratch(&mut caller, b""); }
         let path = read_str(&mut caller, path_ptr, path_len);
@@ -1018,6 +1034,56 @@ mod tests {
         // host import tested above.
         let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("now-plausible"), HashSet::new(), dir.path().to_path_buf()).unwrap();
         assert_eq!(plugin.check(), MonitorStatus::Healthy, "now() should return a real, recent-ish wall-clock value with no capability granted");
+    }
+
+    // check() reports Healthy exactly when window_server answered with the
+    // capability-denied error, told apart by its length.
+    fn window_server_gate_fixture_wat(capabilities: &[&str]) -> String {
+        let denied = "{\"error\":\"capability not granted\"}";
+        let healthy = "{\"kind\":\"Healthy\"}";
+        let unhealthy = "{\"kind\":\"Unhealthy\",\"detail\":\"window_server was not denied\"}";
+        format!(
+            r#"(module
+  (import "kennel" "window_server" (func $window_server (param i32 i32) (result i64)))
+  (memory (export "memory") 2)
+  (data (i32.const 0) "sketchybar")
+  (data (i32.const 4096) "{healthy_wat}")
+  (data (i32.const 4200) "{unhealthy_wat}")
+{manifest_export}
+  (func (export "__kennel_scratch_ptr") (result i32) i32.const 65536)
+  (func (export "check") (result i64)
+    (if (result i64)
+      (i64.eq (i64.and (call $window_server (i32.const 0) (i32.const 10)) (i64.const 0xFFFFFFFF)) (i64.const {denied_len}))
+      (then
+        (i64.or (i64.shl (i64.extend_i32_u (i32.const 4096)) (i64.const 32)) (i64.extend_i32_u (i32.const {healthy_len}))))
+      (else
+        (i64.or (i64.shl (i64.extend_i32_u (i32.const 4200)) (i64.const 32)) (i64.extend_i32_u (i32.const {unhealthy_len}))))))
+  (func (export "fix")))
+"#,
+            healthy_wat = wat_escape(healthy),
+            unhealthy_wat = wat_escape(unhealthy),
+            healthy_len = healthy.len(),
+            unhealthy_len = unhealthy.len(),
+            denied_len = denied.len(),
+            manifest_export = manifest_export_wat("window-server-gate", capabilities, 6000),
+        )
+    }
+
+    #[test]
+    fn window_server_is_denied_without_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = write_wat_fixture(dir.path(), &window_server_gate_fixture_wat(&[]));
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest("window-server-gate"), HashSet::new(), dir.path().to_path_buf()).unwrap();
+        assert_eq!(plugin.check(), MonitorStatus::Healthy);
+    }
+
+    #[test]
+    fn window_server_answers_with_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = write_wat_fixture(dir.path(), &window_server_gate_fixture_wat(&["window_server"]));
+        let caps = [Capability::WindowServer];
+        let mut plugin = WasmPlugin::load(&wasm_path, test_manifest_with_caps("window-server-gate", &caps), caps.into_iter().collect(), dir.path().to_path_buf()).unwrap();
+        assert!(matches!(plugin.check(), MonitorStatus::Unhealthy { .. }), "a granted call must not come back as the denial");
     }
 
     // Records what reaches the event service.
