@@ -7,6 +7,7 @@ use std::time::Duration;
 use kennel_proto::{Capability, ExtensionManifest, MonitorStatus};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 use crate::events::{EmitOutcome, EventSink};
+use crate::{ext_config, filesystem};
 
 // Matches kennel_guest_sdk::SCRATCH_LEN -- the fixed size of the guest's scratch buffer.
 const SCRATCH_LEN: usize = 65536;
@@ -45,6 +46,11 @@ struct HostCtx {
     event_sink: Option<Arc<dyn EventSink>>,
     // Only check() emits. False for fix() and for the load-time manifest() call.
     emit_allowed: bool,
+    event_payload: String,
+    error_payload: String,
+    subscriptions: Vec<kennel_proto::FsSubscription>,
+    config_fields: Vec<kennel_proto::ConfigField>,
+    copy_service: filesystem::CopyService,
 }
 
 // Stops the epoch ticker thread once the last clone of a WasmPlugin is dropped.
@@ -99,6 +105,7 @@ pub struct WasmPlugin {
     data_dir: PathBuf,
     protected_dir: Option<PathBuf>,
     event_sink: Option<Arc<dyn EventSink>>,
+    copy_service: filesystem::CopyService,
     // Shared by every clone; the ticker thread stops when the last one drops.
     _ticker: Arc<EngineTicker>,
 }
@@ -141,6 +148,7 @@ impl WasmPlugin {
             data_dir,
             protected_dir: kennel_support_dir(),
             event_sink: None,
+            copy_service: filesystem::CopyService::new(),
             _ticker: Arc::new(EngineTicker { stop }),
         };
         plugin.verify_guest_manifest()?;
@@ -193,6 +201,10 @@ impl WasmPlugin {
             // Absent from manifests built with an SDK older than events.
             #[serde(default)]
             events: Vec<GuestEventType>,
+            #[serde(default)]
+            fs_subscriptions: Vec<kennel_proto::FsSubscription>,
+            #[serde(default)]
+            config_fields: Vec<kennel_proto::ConfigField>,
         }
         #[derive(serde::Deserialize)]
         struct GuestEventType {
@@ -200,6 +212,12 @@ impl WasmPlugin {
         }
         let guest: GuestManifest = serde_json::from_str(&json).map_err(|e| format!("guest manifest() returned unparseable JSON: {e}"))?;
 
+        if self.manifest.fs_subscriptions != guest.fs_subscriptions {
+            return Err("filesystem subscriptions differ between manifest.toml and WASM".into());
+        }
+        if self.manifest.config_fields != guest.config_fields {
+            return Err("configuration fields differ between manifest.toml and WASM".into());
+        }
         // Same rule for event types as for capabilities: a subscription is made
         // against manifest.toml's list, so the code must emit exactly that.
         let name = &self.manifest.name;
@@ -225,6 +243,11 @@ impl WasmPlugin {
             event_types: self.manifest.events.iter().map(|e| e.name.clone()).collect(),
             event_sink: self.event_sink.clone(),
             emit_allowed,
+            event_payload: String::new(),
+            error_payload: String::new(),
+            subscriptions: self.manifest.fs_subscriptions.clone(),
+            config_fields: self.manifest.config_fields.clone(),
+            copy_service: self.copy_service.clone(),
         };
         let mut store = Store::new(&self.engine, ctx);
         store.set_epoch_deadline((GUEST_CALL_DEADLINE.as_millis() / EPOCH_TICK.as_millis()) as u64);
@@ -235,6 +258,48 @@ impl WasmPlugin {
         store.data_mut().scratch_ptr = ptr;
 
         Ok((store, instance))
+    }
+
+    fn call_handler(&self, export: &str, payload: &str) -> Result<(), String> {
+        let (mut store, instance) = self.fresh_instance(false)?;
+        if export == "on_event" {
+            store.data_mut().event_payload = payload.into();
+        } else {
+            store.data_mut().error_payload = payload.into();
+        }
+        // Only on_error is optional. A filesystem-subscribed extension must
+        // implement on_event or it fails the first delivery.
+        let func = match instance.get_typed_func::<(), u64>(&mut store, export) {
+            Ok(f) => f,
+            Err(e) if export == "on_error" => { let _ = e; return Ok(()); }
+            Err(e) => return Err(format!("extension has no {export} export: {e}")),
+        };
+        let packed = func.call(&mut store, ()).map_err(|e| e.to_string())?;
+        let status = Self::read_guest_string(&mut store, &instance, packed)?;
+        let value: serde_json::Value = serde_json::from_str(&status).map_err(|e| e.to_string())?;
+        if value.get("kind").and_then(|k| k.as_str()) != Some("Healthy") {
+            return Err(value.get("detail").and_then(|d| d.as_str())
+                .unwrap_or("handler returned unhealthy").into());
+        }
+        Ok(())
+    }
+
+    fn process_filesystem_events(&self) -> Result<(), String> {
+        for failure in self.copy_service.take_errors() {
+            filesystem::invalidate(&self.manifest.fs_subscriptions, &self.data_dir, &failure.source);
+            let payload = serde_json::json!({
+                "source": failure.source, "error": failure.detail
+            });
+            self.call_handler("on_error", &payload.to_string())?;
+        }
+        if !self.capabilities.contains(&Capability::FsWatch) { return Ok(()); }
+        for sub in &self.manifest.fs_subscriptions {
+            filesystem::reconcile(sub, &self.data_dir, |event| {
+                let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+                self.call_handler("on_event", &payload)
+            })?;
+        }
+        Ok(())
     }
 
     fn read_guest_string(store: &mut Store<HostCtx>, instance: &Instance, packed: u64) -> Result<String, String> {
@@ -266,6 +331,9 @@ impl crate::plugin::Plugin for WasmPlugin {
     }
 
     fn check(&mut self) -> MonitorStatus {
+        if let Err(detail) = self.process_filesystem_events() {
+            return MonitorStatus::Unhealthy { detail };
+        }
         let (mut store, instance) = match self.fresh_instance(true) {
             Ok(pair) => pair,
             Err(e) => return MonitorStatus::Errored { detail: e },
@@ -569,6 +637,50 @@ fn register_host_imports(linker: &mut Linker<HostCtx>) {
 
     // Returns 1 when the event was accepted, 2 when kenneld already had that id
     // from this extension, 0 when it was rejected (reason in the error log).
+
+    linker.func_wrap("kennel", "current_event", |mut caller: Caller<'_, HostCtx>| -> u64 {
+        let payload = caller.data().event_payload.clone();
+        write_scratch(&mut caller, payload.as_bytes())
+    }).expect("register current_event");
+
+    linker.func_wrap("kennel", "current_error", |mut caller: Caller<'_, HostCtx>| -> u64 {
+        let payload = caller.data().error_payload.clone();
+        write_scratch(&mut caller, payload.as_bytes())
+    }).expect("register current_error");
+
+    linker.func_wrap("kennel", "config_get", |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32| -> u64 {
+        let key = read_str(&mut caller, ptr, len);
+        let value = ext_config::load(&caller.data().data_dir).get(&key).cloned().unwrap_or_default();
+        write_scratch(&mut caller, value.as_bytes())
+    }).expect("register config_get");
+
+    linker.func_wrap("kennel", "fs_copy", |mut caller: Caller<'_, HostCtx>, src_ptr: i32, src_len: i32, dst_ptr: i32, dst_len: i32| -> i32 {
+        if !require_capability(&caller, Capability::FsCopy) { return 0; }
+        let source = read_str(&mut caller, src_ptr, src_len);
+        let folder = read_str(&mut caller, dst_ptr, dst_len);
+        if folder.is_empty() || folder == "." || folder == ".."
+            || folder.contains('/') || folder.contains('\\') { return 0; }
+        let ctx = caller.data();
+        let source = match filesystem::approved_source(Path::new(&source), &ctx.subscriptions) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[{}] fs_copy denied: {e}", ctx.extension_name);
+                return 0;
+            }
+        };
+        let Some(field) = ctx.config_fields.first() else { return 0 };
+        let destination = match ext_config::configured_directory(&ctx.data_dir, &ctx.config_fields, &field.name) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[{}] fs_copy denied: {e}", ctx.extension_name);
+                return 0;
+            }
+        };
+        // A destination folder is always created beneath the selected, already
+        // canonicalized account folder; the extension cannot redirect it.
+        ctx.copy_service.enqueue(source, destination.join(folder), destination).is_ok() as i32
+    }).expect("register fs_copy");
+
     linker.func_wrap("kennel", "emit", |mut caller: Caller<'_, HostCtx>, type_ptr: i32, type_len: i32, id_ptr: i32, id_len: i32, payload_ptr: i32, payload_len: i32| -> i32 {
         let extension = caller.data().extension_name.clone();
         if !require_capability(&caller, Capability::Emit) {
@@ -708,7 +820,7 @@ mod tests {
     }
 
     fn test_manifest_with_caps(name: &str, capabilities: &[Capability]) -> ExtensionManifest {
-        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: capabilities.to_vec(), privileged_commands: vec![], events: vec![] }
+        ExtensionManifest { name: name.into(), version: "0.1.0".into(), description: "".into(), interval_secs: 1, capabilities: capabilities.to_vec(), privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] }
     }
 
     #[test]

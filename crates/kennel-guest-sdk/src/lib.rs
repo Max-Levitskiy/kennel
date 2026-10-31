@@ -11,6 +11,8 @@ pub struct Manifest {
     pub capabilities: Vec<&'static str>,
     pub privileged_commands: Vec<&'static str>,
     pub events: Vec<EventType>,
+    pub fs_subscriptions: Vec<FsSubscription>,
+    pub config_fields: Vec<ConfigField>,
 }
 
 // An event type the extension may emit with `host_emit`. Must match a
@@ -21,6 +23,137 @@ pub struct EventType {
     pub name: &'static str,
     pub description: &'static str,
     pub example_payload: &'static str,
+}
+
+
+// Typed declarative subscriptions. The host checks file kinds/patterns and
+// paths before dispatch. The marker makes handlers incompatible at compile time.
+#[derive(Serialize)]
+pub struct FsSubscription {
+    pub id: &'static str,
+    pub path: &'static str,
+    pub pattern: &'static str,
+    pub kind: FsKind,
+    pub recursive: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsKind { File, Directory }
+
+#[derive(Serialize)]
+pub struct DirectoryOptions {
+    pub root: &'static str,
+    pub prefix: &'static str,
+    pub child: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct ConfigField {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub directories: DirectoryOptions,
+}
+
+pub trait FileMarker {
+    const EXTENSION: &'static str;
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawFsEvent {
+    pub subscription: String,
+    pub path: String,
+    pub change: String,
+}
+
+pub struct FsEvent<M: FileMarker> {
+    pub subscription: String,
+    pub change: String,
+    file: String,
+    _marker: std::marker::PhantomData<M>,
+}
+
+impl<M: FileMarker> FsEvent<M> {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        let raw: RawFsEvent = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if !raw.path.to_ascii_lowercase().ends_with(M::EXTENSION) {
+            return Err("event does not match typed file marker".into());
+        }
+        Ok(Self {
+            subscription: raw.subscription,
+            change: raw.change,
+            file: raw.path,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn file(&self) -> &str { &self.file }
+}
+
+// The same trait can be implemented for other event types in future versions.
+pub trait Handler<E> {
+    fn on_event(&self, event: E) -> Result<(), String>;
+    fn on_error(&self, _error: &str) -> Result<(), String> { Ok(()) }
+}
+
+pub fn host_event_payload() -> String {
+    let packed = unsafe { current_event() };
+    let (ptr, len) = unpack(packed);
+    read_from_scratch(ptr, len)
+}
+
+pub fn host_error_payload() -> String {
+    let packed = unsafe { current_error() };
+    let (ptr, len) = unpack(packed);
+    read_from_scratch(ptr, len)
+}
+
+// Destination folder is a relative path inside a user-selected directory.
+// The native daemon validates the source against fs_subscriptions, and the
+// destination against the selected directory option before queueing the copy.
+pub fn host_fs_copy(source: &str, folder: &str) -> bool {
+    unsafe { fs_copy(source.as_ptr() as i32, source.len() as i32, folder.as_ptr() as i32, folder.len() as i32) != 0 }
+}
+
+pub fn host_config_get(key: &str) -> String {
+    let packed = unsafe { config_get(key.as_ptr() as i32, key.len() as i32) };
+    let (ptr, len) = unpack(packed);
+    read_from_scratch(ptr, len)
+}
+
+// A new extension uses this macro with an implementation of Handler<FsEvent<M>>.
+// The generated ABI stays C-style and never exposes Rust layouts across WASM.
+#[macro_export]
+macro_rules! kennel_fs_extension {
+    ($manifest_fn:path, $check_fn:path, $fix_fn:path, $handler:ty, $marker:ty) => {
+        $crate::kennel_extension!($manifest_fn, $check_fn, $fix_fn);
+
+        #[no_mangle]
+        pub extern "C" fn on_event() -> u64 {
+            let result: Result<(), String> = (|| {
+                let event = $crate::FsEvent::<$marker>::parse(&$crate::host_event_payload())?;
+                let handler = <$handler as Default>::default();
+                <$handler as $crate::Handler<$crate::FsEvent<$marker>>>::on_event(&handler, event)
+            })();
+            let status = match result {
+                Ok(()) => $crate::Status::Healthy,
+                Err(e) => $crate::Status::Unhealthy(e),
+            };
+            $crate::pack_into_scratch(&serde_json::to_vec(&status).expect("serialize handler status"))
+        }
+
+        #[no_mangle]
+        pub extern "C" fn on_error() -> u64 {
+            let handler = <$handler as Default>::default();
+            let status = match <$handler as $crate::Handler<$crate::FsEvent<$marker>>>::on_error(
+                &handler, &$crate::host_error_payload()
+            ) {
+                Ok(()) => $crate::Status::Healthy,
+                Err(e) => $crate::Status::Unhealthy(e),
+            };
+            $crate::pack_into_scratch(&serde_json::to_vec(&status).expect("serialize error status"))
+        }
+    };
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +187,10 @@ extern "C" {
     fn log(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32);
     fn now() -> u64;
     fn emit(type_ptr: i32, type_len: i32, id_ptr: i32, id_len: i32, payload_ptr: i32, payload_len: i32) -> i32;
+    fn current_event() -> u64;
+    fn current_error() -> u64;
+    fn fs_copy(source_ptr: i32, source_len: i32, folder_ptr: i32, folder_len: i32) -> i32;
+    fn config_get(key_ptr: i32, key_len: i32) -> u64;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

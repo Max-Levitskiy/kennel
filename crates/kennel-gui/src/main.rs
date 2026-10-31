@@ -206,6 +206,30 @@ impl eframe::App for KennelApp {
                             }
                             ui.label(format!("{:?}", ext.last_status));
                         });
+                        for field in &ext.manifest.config_fields {
+                            ui.horizontal(|ui| {
+                                ui.label(&field.label);
+                                if let Some(client) = &mut self.client {
+                                    let saved = client.get_config(&ext.manifest.name).unwrap_or_default();
+                                    let current = saved.get(&field.name).cloned().unwrap_or_default();
+                                    match client.list_config_options(&ext.manifest.name, &field.name) {
+                                        Ok(options) => {
+                                            let label = options.iter().find(|o| o.value == current)
+                                                .map(|o| o.label.as_str()).unwrap_or("(select account)");
+                                            egui::ComboBox::from_id_salt((&ext.manifest.name, &field.name))
+                                                .selected_text(label).show_ui(ui, |ui| {
+                                                    for option in options {
+                                                        if ui.selectable_label(option.value == current, &option.label).clicked() {
+                                                            let _ = client.set_config(&ext.manifest.name, &field.name, &option.value);
+                                                        }
+                                                    }
+                                                });
+                                        }
+                                        Err(message) => { ui.label(message); }
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
                 Tab::Browse => {

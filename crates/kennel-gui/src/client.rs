@@ -43,6 +43,32 @@ impl Client {
         }
     }
 
+    pub fn get_config(&mut self, extension: &str) -> Result<std::collections::HashMap<String, String>, String> {
+        match self.roundtrip(&Request::GetConfig { extension: extension.into() })? {
+            Response::Config(v) => Ok(v),
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+
+    pub fn list_config_options(&mut self, extension: &str, field: &str) -> Result<Vec<kennel_proto::ConfigChoice>, String> {
+        match self.roundtrip(&Request::ListConfigOptions { extension: extension.into(), field: field.into() })? {
+            Response::ConfigOptions(v) => Ok(v),
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+
+    pub fn set_config(&mut self, extension: &str, field: &str, value: &str) -> Result<(), String> {
+        match self.roundtrip(&Request::SetConfig {
+            extension: extension.into(), field: field.into(), value: value.into()
+        })? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+
     fn roundtrip(&mut self, req: &Request) -> Result<Response, String> {
         let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
         line.push('\n');

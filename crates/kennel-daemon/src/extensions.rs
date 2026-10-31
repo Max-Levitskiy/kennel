@@ -25,6 +25,10 @@ struct ManifestToml {
     privileged_commands: Vec<String>,
     #[serde(default)]
     events: Vec<EventType>,
+    #[serde(default)]
+    fs_subscriptions: Vec<kennel_proto::FsSubscription>,
+    #[serde(default)]
+    config_fields: Vec<kennel_proto::ConfigField>,
 }
 
 // Scans `dir` for extensions and registers any that aren't registered yet,
@@ -58,6 +62,34 @@ pub fn scan_and_register(dir: &Path, registry: &Registry, event_sink: Option<Arc
             continue;
         }
 
+        if !parsed.fs_subscriptions.is_empty()
+            && !parsed.capabilities.contains(&Capability::FsWatch) {
+            eprintln!("skipping {}: filesystem subscriptions need fs_watch", parsed.name);
+            continue;
+        }
+        if !parsed.config_fields.is_empty()
+            && !parsed.capabilities.contains(&Capability::FsDiscover) {
+            eprintln!("skipping {}: directory choices need fs_discover", parsed.name);
+            continue;
+        }
+        if parsed.fs_subscriptions.iter().any(|s|
+            s.id.is_empty() || s.id.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            || !crate::filesystem::valid_pattern(&s.pattern)
+            || crate::ext_config::expand(&s.path).is_err())
+        {
+            eprintln!("skipping {}: invalid filesystem subscription", parsed.name);
+            continue;
+        }
+        if parsed.config_fields.iter().any(|f|
+            f.name.is_empty()
+            || !f.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::ext_config::expand(&f.directories.root).is_err()
+            || f.directories.child.contains("..")
+            || f.directories.child.starts_with('/'))
+        {
+            eprintln!("skipping {}: invalid config field", parsed.name);
+            continue;
+        }
         if parsed.interval_secs < MIN_INTERVAL_SECS {
             eprintln!("skipping {}: interval_secs = {} is below the {MIN_INTERVAL_SECS}s minimum", parsed.name, parsed.interval_secs);
             continue;
@@ -76,6 +108,8 @@ pub fn scan_and_register(dir: &Path, registry: &Registry, event_sink: Option<Arc
             capabilities: parsed.capabilities.clone(),
             privileged_commands: parsed.privileged_commands,
             events: parsed.events,
+            fs_subscriptions: parsed.fs_subscriptions,
+            config_fields: parsed.config_fields,
         };
         let capabilities: HashSet<Capability> = parsed.capabilities.into_iter().collect();
         let data_dir = ext_dir.join("data");
