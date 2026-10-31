@@ -114,7 +114,7 @@ mod tests {
     }
     impl Plugin for CountingPlugin {
         fn manifest(&self) -> ExtensionManifest {
-            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
+            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] }
         }
         fn check(&mut self) -> MonitorStatus {
             self.checks.fetch_add(1, Ordering::SeqCst);
@@ -150,7 +150,7 @@ mod tests {
         let (c1, f1) = (checks.clone(), fixes.clone());
         let registry = Registry::new();
         registry.register(
-            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] },
+            ExtensionManifest { name: "counting".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] },
             Arc::new(move || Box::new(CountingPlugin { checks: c1.clone(), fixes: f1.clone() }) as Box<dyn Plugin>) as PluginFactory,
         );
         registry

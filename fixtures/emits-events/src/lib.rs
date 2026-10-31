@@ -12,6 +12,7 @@ fn my_manifest() -> Manifest {
         capabilities: vec!["emit"],
         privileged_commands: vec![],
         events: vec![EventType { name: "ping", description: "a test ping", example_payload: r#"{"n": 0}"# }],
+        ..Default::default()
     }
 }
 fn my_check() -> Status {

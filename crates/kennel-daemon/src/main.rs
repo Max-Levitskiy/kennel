@@ -1,4 +1,6 @@
 mod events;
+mod ext_config;
+mod filesystem;
 #[cfg(test)]
 mod events_e2e_tests;
 mod extensions;

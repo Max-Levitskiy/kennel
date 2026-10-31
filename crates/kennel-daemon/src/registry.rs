@@ -83,7 +83,7 @@ mod tests {
     struct FakePlugin { healthy: bool }
     impl Plugin for FakePlugin {
         fn manifest(&self) -> ExtensionManifest {
-            ExtensionManifest { name: "fake".into(), version: "0.0.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
+            ExtensionManifest { name: "fake".into(), version: "0.0.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] }
         }
         fn check(&mut self) -> MonitorStatus {
             if self.healthy { MonitorStatus::Healthy } else { MonitorStatus::Unhealthy { detail: "nope".into() } }
@@ -92,7 +92,7 @@ mod tests {
     }
 
     fn fake_manifest() -> ExtensionManifest {
-        ExtensionManifest { name: "fake".into(), version: "0.0.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
+        ExtensionManifest { name: "fake".into(), version: "0.0.0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] }
     }
 
     #[test]

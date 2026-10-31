@@ -16,6 +16,9 @@ pub enum Capability {
     Log,
     Notify,
     Emit,
+    FsWatch,
+    FsDiscover,
+    FsCopy,
 }
 
 // An event type an extension may emit, declared up front so a subscription can
@@ -35,6 +38,45 @@ fn empty_json_object() -> String {
     "{}".into()
 }
 
+
+// Paths in these declarations are manifest-owned (never taken from an event).
+// The file pattern is either an exact name or one wildcard, e.g. "*.m4a".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsKind { File, Directory }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSubscription {
+    pub id: String,
+    pub path: String,
+    pub pattern: String,
+    pub kind: FsKind,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+// A select control. Kennel enumerates only directory names beneath root;
+// the extension never gains general read access to those directories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryOptions {
+    pub root: String,
+    pub prefix: String,
+    pub child: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigField {
+    pub name: String,
+    pub label: String,
+    pub directories: DirectoryOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChoice {
+    pub value: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub name: String,
@@ -46,6 +88,10 @@ pub struct ExtensionManifest {
     pub privileged_commands: Vec<String>, // only meaningful with Capability::PrivilegedSpawn
     #[serde(default)]
     pub events: Vec<EventType>,
+    #[serde(default)]
+    pub fs_subscriptions: Vec<FsSubscription>,
+    #[serde(default)]
+    pub config_fields: Vec<ConfigField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,6 +192,9 @@ pub enum Request {
     ListEvents,
     // Newest first.
     ListRuns,
+    GetConfig { extension: String },
+    ListConfigOptions { extension: String, field: String },
+    SetConfig { extension: String, field: String, value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +206,8 @@ pub enum Response {
     Subscription(Subscription),
     Events(Vec<EventRecord>),
     Runs(Vec<Run>),
+    Config(std::collections::HashMap<String, String>),
+    ConfigOptions(Vec<ConfigChoice>),
 }
 
 #[cfg(test)]
@@ -172,7 +223,7 @@ mod tests {
             interval_secs: 30,
             capabilities: vec![Capability::Spawn, Capability::WriteFile, Capability::State],
             privileged_commands: vec![],
-            events: vec![],
+            events: vec![], fs_subscriptions: vec![], config_fields: vec![],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ExtensionManifest = serde_json::from_str(&json).unwrap();

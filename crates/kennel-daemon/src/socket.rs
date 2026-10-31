@@ -100,6 +100,31 @@ fn handle_request(manager: &SchedulerManager, req: Request, extensions_dir: &Pat
         },
         Request::ListEvents => Response::Events(events.list_events()),
         Request::ListRuns => Response::Runs(events.list_runs()),
+        Request::GetConfig { extension } => {
+            let known = manager.registry().list().into_iter().any(|e| e.manifest.name == extension);
+            if !known { return Response::Error { message: "extension not installed".into() }; }
+            Response::Config(crate::ext_config::load(&extensions_dir.join(&extension).join("data")))
+        }
+        Request::ListConfigOptions { extension, field } => {
+            let Some(info) = manager.registry().list().into_iter().find(|e| e.manifest.name == extension) else {
+                return Response::Error { message: "extension not installed".into() };
+            };
+            match crate::ext_config::field(&info.manifest.config_fields, &field)
+                .and_then(|f| crate::ext_config::available(&f.directories)) {
+                Ok(choices) => Response::ConfigOptions(choices),
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::SetConfig { extension, field, value } => {
+            let Some(info) = manager.registry().list().into_iter().find(|e| e.manifest.name == extension) else {
+                return Response::Error { message: "extension not installed".into() };
+            };
+            match crate::ext_config::set_value(
+                &extensions_dir.join(&extension).join("data"), &info.manifest.config_fields, &field, &value) {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        },
     }
 }
 
@@ -115,7 +140,7 @@ mod tests {
     struct NoopPlugin;
     impl Plugin for NoopPlugin {
         fn manifest(&self) -> ExtensionManifest {
-            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] }
+            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] }
         }
         fn check(&mut self) -> MonitorStatus { MonitorStatus::Healthy }
         fn fix(&mut self) {}
@@ -129,7 +154,7 @@ mod tests {
 
         let registry = Registry::new();
         registry.register(
-            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![] },
+            ExtensionManifest { name: "noop".into(), version: "0".into(), description: "".into(), interval_secs: 1, capabilities: vec![], privileged_commands: vec![], events: vec![], fs_subscriptions: vec![], config_fields: vec![] },
             Arc::new(|| Box::new(NoopPlugin) as Box<dyn Plugin>) as PluginFactory,
         );
         let manager = Arc::new(SchedulerManager::new(registry, state_path));
